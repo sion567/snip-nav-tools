@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SnipNav · 本地命令速查</title>
+<script>
+  // 首帧前应用记忆的主题，避免闪烁（键名与 app.js 的 toggleTheme 保持一致）
+  try {
+    if (localStorage.getItem('snipnav-theme') === 'light') {
+      document.documentElement.dataset.theme = 'light';
+    }
+  } catch (e) {}
+</script>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='80' font-size='80'>🧭</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app"></div>
+<script src="vendor/vue.global.prod.js"></script>
+<script src="js/api.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "exported": "2026-10-26",
+  "entries": [
+    {
+      "intent": "docker logs 按时间+级别过滤",
+      "cmd": "docker logs -f mycontainer --since 2026-10-25T00:00:00 | grep ERROR",
+      "project": "shop-admin",
+      "tags": [
+        "docker",
+        "filter",
+        "linux",
+        "log"
+      ],
+      "usedCount": 12,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "docker logs 只看末尾 100 行",
+      "cmd": "docker logs --tail 100 -t mycontainer",
+      "project": "shop-admin",
+      "tags": [
+        "docker",
+        "log"
+      ],
+      "usedCount": 5,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "gradle bootRun 指定端口启动",
+      "cmd": "./gradlew bootRun --args=\"--server.port=8081\"",
+      "project": "tools-help",
+      "tags": [
+        "gradle",
+        "network",
+        "run"
+      ],
+      "usedCount": 8,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "git log 找包含关键字的提交",
+      "cmd": "git log --oneline --grep=\"登录\"",
+      "project": "shop-admin",
+      "tags": [
+        "filter",
+        "git",
+        "linux",
+        "log"
+      ],
+      "usedCount": 6,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "kubectl 看 pod 日志尾部",
+      "cmd": "kubectl logs -f my-pod -n prod --tail=100",
+      "project": "tools-help",
+      "tags": [
+        "k8s",
+        "log"
+      ],
+      "usedCount": 3,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "查端口占用（Windows）",
+      "cmd": "netstat -ano | findstr :8080",
+      "project": "tools-help",
+      "tags": [
+        "filter",
+        "network",
+        "windows"
+      ],
+      "usedCount": 9,
+      "notes": "示例记录：可随时删除"
+    },
+    {
+      "intent": "看容器资源占用",
+      "cmd": "ffmpeg -i a.mp4 -vn out.m4a",
+      "project": "proj",
+      "tags": [
+        "docker"
+      ],
+      "usedCount": 0,
+      "notes": null
+    }
+  ]
+}

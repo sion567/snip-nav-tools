@@ -1,0 +1,4 @@
+/src-tauri/target/
+/src-tauri/Cargo.lock.bak
+__pycache__/
+*.log
