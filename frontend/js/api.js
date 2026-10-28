@@ -220,6 +220,8 @@
         M.snippets.forEach((s) => (s.tags || []).forEach((t) => { cnt[t] = (cnt[t] || 0) + 1; }));
         return Object.keys(cnt).map((name) => ({ name, count: cnt[name] })).sort((a, b) => b.count - a.count || a.name.localeCompare(b.name)).slice(0, 60);
       }
+      case 'app_version':
+        return '0.0.0-mock';
       case 'import_tldr':
         return { pages: 0, snippets: 0, skipped: 0 };
       case 'generate_params': {

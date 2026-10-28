@@ -261,11 +261,12 @@ html[data-theme="light"] .badge.ai { color: #8250df; }
 }
 .sep { width: 1px; height: 12px; background: var(--border); flex-shrink: 0; }
 .statusbar > span { flex-shrink: 0; }
-/* .dir 例外：允许收缩以截断长路径（需盖过上面的 > span 规则） */
+/* .dir 例外：按内容取宽（flex-basis:auto），空间不足时收缩截断长路径
+   （flex-basis:0 且无 grow 会让基准宽度恒为 0，路径永远不可见——已修） */
 .statusbar > span.dir {
   margin-left: auto; font-family: var(--mono); font-size: 11px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  min-width: 0; flex-shrink: 1; flex-basis: 0;
+  min-width: 0; flex-shrink: 1; flex-basis: auto;
 }
 
 /* ---------- 模态 ---------- */

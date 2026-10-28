@@ -316,6 +316,12 @@ pub fn generate_params(
     Ok(GenerateResult { parsed, added })
 }
 
+/// 顶栏徽标读真实版本（单一来源 tauri.conf.json，避免硬编码漂移）。
+#[tauri::command]
+pub fn app_version(app: tauri::AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
 #[tauri::command]
 pub fn copy_to_clipboard(text: String) -> Result<(), String> {
     let mut cb = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败: {e}"))?;

@@ -20,6 +20,7 @@ const store = reactive({
   panel: null,
   composed: [],                // [{key, text, desc}]
   stats: { total: 0, self: 0, tldr: 0, doc: 0, projects: [], dataDir: '' },
+  appVersion: '',               // 顶栏徽标（IPC 读 tauri.conf.json 版本，避免硬编码漂移）
   tagList: [],
   toast: '',
   dialog: { open: false, editing: null, form: emptyForm() },
@@ -35,10 +36,11 @@ const store = reactive({
 store.quickTags = computed(() => {
   const seen = new Set();
   const out = [];
+  // 动态高频在前：静态常量只补位，不再挤占库里实际常用的标签
   for (const t of store.tagList.slice(0, 8).concat(QUICK_TAGS)) {
     if (!seen.has(t)) { seen.add(t); out.push(t); }
   }
-  return out.slice(0, 10);
+  return out.slice(0, 12);
 });
 store.composedCmd = computed(() => {
   const base = store.panel ? store.panel.base.cmd : '';
@@ -101,6 +103,7 @@ function setProject(p) {
 
 async function refreshStats() {
   try { Object.assign(store.stats, await SNIP.invoke('stats')); } catch (e) { /* 忽略 */ }
+  try { store.appVersion = await SNIP.invoke('app_version'); } catch (e) { /* 忽略 */ }
 }
 async function refreshTags() {
   try { store.tagList = (await SNIP.invoke('tags')).map((t) => t.name); } catch (e) { /* 忽略 */ }
@@ -673,7 +676,7 @@ createApp({
   template: `
 <div class="app">
   <header class="topbar">
-    <div class="brand"><span class="logo">🧭</span><b>SnipNav</b><span class="ver">v0.1 本地命令速查</span></div>
+    <div class="brand"><span class="logo">🧭</span><b>SnipNav</b><span class="ver">v{{store.appVersion || '?'}} 本地命令速查</span></div>
     <div class="top-actions">
       <button class="btn" :title="store.theme === 'dark' ? '切换到明亮模式' : '切换到暗黑模式'" @click="toggleTheme()">{{ store.theme === 'dark' ? '🌙' : '☀️' }}</button>
       <button class="btn" title="最近执行的命令" @click="openHistory()">🕘 历史</button>

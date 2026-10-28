@@ -41,6 +41,7 @@ pub fn run_gui() {
             commands::explore_save,
             commands::stats,
             commands::tags,
+            commands::app_version,
             commands::import_tldr,
             commands::generate_params,
             commands::get_doc_body,
