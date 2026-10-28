@@ -149,12 +149,13 @@ mod tests {
 
         let n = export_self(&conn, &file).unwrap();
         assert!(n >= 6, "种子个人记录应全部导出");
+        let total_before = db::count(&conn, "snippets");
 
         // 同库重导入：全部命中同命令 → merged，无新增
         let st = import_share(&conn, &file).unwrap();
         assert_eq!(st.added, 0);
         assert_eq!(st.merged, n);
-        assert_eq!(db::count(&conn, "snippets"), 29, "总量不应变化");
+        assert_eq!(db::count(&conn, "snippets"), total_before, "总量不应变化");
 
         // 改一份"别人的"文件：改 intent/加新条目 → 新增
         let mut sf: ShareFile = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();

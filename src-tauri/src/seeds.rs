@@ -47,6 +47,19 @@ const PARAM_SEEDS: &[(&str, &str, &str, &str, &str, &str)] = &[
     ("kubectl", "logs", "output", "--tail=<N>", "尾部 N 行", "--tail=100"),
     ("kubectl", "logs", "filter", "-n <namespace>", "指定命名空间", "-n prod"),
     ("kubectl", "logs", "filter", "-c <容器>", "指定容器", "-c app"),
+    // mvn
+    ("mvn", "", "build", "clean package", "清理并打包", "clean package -DskipTests"),
+    ("mvn", "", "build", "clean install", "装进本地仓库供其他项目依赖", "clean install -DskipTests"),
+    ("mvn", "", "build", "test", "只跑单元测试", "test"),
+    ("mvn", "", "build", "dependency:tree", "看依赖树排查版本冲突", "dependency:tree"),
+    ("mvn", "", "run", "-DskipTests", "跳过测试", "-DskipTests"),
+    ("mvn", "", "run", "-o", "离线模式（依赖已拉齐时给 CI 提速）", "-o clean compile"),
+    // sqlite3
+    ("sqlite3", "", "output", "-header -column", "表头 + 列对齐显示", "-header -column"),
+    ("sqlite3", "", "output", "-csv", "结果按 CSV 输出", "-csv"),
+    ("sqlite3", "", "other", ".tables", "列出所有表", ".tables"),
+    ("sqlite3", "", "other", ".schema <表>", "看建表语句", ".schema users"),
+    ("sqlite3", "", "other", ".dump", "整库导出为 SQL 文本", ".dump > backup.sql"),
 ];
 
 // (base_cmd, suffix, used_count)
@@ -82,7 +95,17 @@ const BUILTIN_TLDR: &[&str] = &[
     include_str!("../seeds/tldr_zh/tar.md"),
     include_str!("../seeds/tldr_zh/jq.md"),
     include_str!("../seeds/tldr_zh/docker-logs.md"),
+    include_str!("../seeds/tldr_zh/mvn.md"),
+    include_str!("../seeds/tldr_zh/gradle.md"),
+    include_str!("../seeds/tldr_zh/sqlite3.md"),
+    include_str!("../seeds/tldr_zh/mysql.md"),
+    include_str!("../seeds/tldr_zh/psql.md"),
 ];
+
+// 新增内置页时 +1：老库按此版本号增量补导（import_text 幂等去重，重复导入自动跳过）
+const TLDR_SEED_VERSION: i64 = 3;
+// 新增参数树种子时 +1：param_tree 无唯一约束，补导前按 (tool, command, flag) 查重
+const PARAM_SEED_VERSION: i64 = 2;
 
 pub fn seed_all(conn: &Connection) -> Result<(), String> {
     // v1.2 P0-4：LIMIT 1 存在性判断，替代 COUNT(*) 全表计数
@@ -96,6 +119,41 @@ pub fn seed_all(conn: &Connection) -> Result<(), String> {
             )
             .map_err(|e| e.to_string())?;
         }
+    }
+
+    // v1.3：参数树按版本号补导——老库（param_tree 非空）升级后也能拿到新工具的参数树。
+    // 表无唯一约束，逐行查重后只插缺失的，排到现有行之后。
+    let p_seeded: i64 = db::get_setting(conn, "param_seed_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if p_seeded < PARAM_SEED_VERSION {
+        if !db::is_empty(conn, "param_tree") {
+            let mut next_sort: i64 = conn
+                .query_row("SELECT IFNULL(MAX(sort_order), 0) FROM param_tree", [], |r| r.get(0))
+                .unwrap_or(0);
+            for row in PARAM_SEEDS {
+                let (tool, command, category, flag, desc, example) = *row;
+                let dup: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM param_tree
+                         WHERE IFNULL(tool,'') = ?1 AND IFNULL(command,'') = ?2 AND flag = ?3",
+                        params![tool, command, flag],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(1); // 查重失败视为已存在，宁缺勿重
+                if dup > 0 {
+                    continue;
+                }
+                next_sort += 1;
+                conn.execute(
+                    "INSERT INTO param_tree(tool, command, category, flag, \"desc\", example, sort_order)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![tool, command, category, flag, desc, example, next_sort],
+                )
+                .map_err(|e| e.to_string())?;
+            }
+        }
+        db::set_setting(conn, "param_seed_version", &PARAM_SEED_VERSION.to_string())?;
     }
 
     if db::is_empty(conn, "patterns") {
@@ -136,6 +194,20 @@ pub fn seed_all(conn: &Connection) -> Result<(), String> {
             importer::import_text(conn, content);
         }
     }
+
+    // v1.3：内置页按版本号补导——老库（snippets 非空）升级后也能拿到新增页面；
+    // 全新库在上面已导过，这里只补记版本号。
+    let seeded: i64 = db::get_setting(conn, "tldr_seed_version")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if seeded < TLDR_SEED_VERSION {
+        if !db::is_empty(conn, "snippets") {
+            for content in BUILTIN_TLDR {
+                importer::import_text(conn, content);
+            }
+        }
+        db::set_setting(conn, "tldr_seed_version", &TLDR_SEED_VERSION.to_string())?;
+    }
     Ok(())
 }
 
@@ -159,5 +231,70 @@ mod tests {
             .unwrap();
         assert_eq!(self_n, 6, "示例个人记录应为 6 条");
         assert!(tldr_n > 10, "内置 tldr 页应产生 10+ 条速查");
+    }
+
+    #[test]
+    fn tldr_seed_backfills_existing_db() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        // 模拟老库：已有个人记录、种子版本号停在旧版（没有 mvn/gradle/sqlite3 等新页与新参数树）
+        db::insert_snippet(
+            &conn,
+            NewSnippet {
+                intent: "老记录",
+                cmd: "echo hi",
+                project: None,
+                tool: None,
+                command: None,
+                variant_of: None,
+                source: "self",
+                verified: true,
+                used_count: 0,
+                last_used: None,
+                notes: None,
+            },
+        )
+        .unwrap();
+        let (t0, c0, cat0, f0, d0, e0) = PARAM_SEEDS[0];
+        conn.execute(
+            "INSERT INTO param_tree(tool, command, category, flag, \"desc\", example, sort_order)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+            params![t0, c0, cat0, f0, d0, e0],
+        )
+        .unwrap();
+        db::set_setting(&conn, "tldr_seed_version", "1").unwrap();
+        db::set_setting(&conn, "param_seed_version", "1").unwrap();
+
+        seed_all(&conn).unwrap();
+        let new_tools: i64 = conn
+            .query_row(
+                "SELECT COUNT(DISTINCT tool) FROM snippets
+                 WHERE source='tldr' AND tool IN ('mvn','gradle','sqlite3','mysql','psql')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(new_tools, 5, "老库升级应补导新增的内置页");
+        let mvn_params: i64 = conn
+            .query_row("SELECT COUNT(*) FROM param_tree WHERE tool='mvn'", [], |r| r.get(0))
+            .unwrap();
+        assert!(mvn_params >= 5, "老库升级应补导新工具的参数树");
+        let total_params: i64 = db::count(&conn, "param_tree");
+        assert_eq!(
+            total_params,
+            PARAM_SEEDS.len() as i64,
+            "补导后参数树应恰好等于种子全集（旧行不重复）"
+        );
+
+        // 版本号已推进：再跑一遍不重复入库
+        let before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snippets WHERE source='tldr'", [], |r| r.get(0))
+            .unwrap();
+        seed_all(&conn).unwrap();
+        let after: i64 = conn
+            .query_row("SELECT COUNT(*) FROM snippets WHERE source='tldr'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(before, after, "版本号到位后不应重复导入");
+        assert_eq!(db::count(&conn, "param_tree"), total_params, "参数树不应重复插入");
     }
 }

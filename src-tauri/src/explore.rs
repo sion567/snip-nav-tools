@@ -12,6 +12,7 @@ pub const CATEGORY_LABELS: &[(&str, &str)] = &[
     ("filter", "内容过滤"),
     ("pipe", "管道过滤"),
     ("run", "运行控制"),
+    ("build", "构建/依赖"),
     ("other", "其他"), // v0.2 --help 生成的未归类参数
 ];
 

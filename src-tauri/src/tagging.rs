@@ -5,6 +5,7 @@ pub const RULES: &[(&str, &[&str])] = &[
     ("k8s", &["kubectl"]),
     ("gradle", &["gradle", "gradlew"]),
     ("maven", &["mvn "]),
+    ("sql", &["sqlite3", "mysql", "psql"]),
     ("git", &["git "]),
     (
         "windows",

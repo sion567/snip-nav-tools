@@ -4,7 +4,7 @@
 
 const { createApp, reactive, computed, watch } = Vue;
 
-const QUICK_TAGS = ['docker', 'git', 'log', 'filter', 'network', 'k8s', 'gradle', 'windows'];
+const QUICK_TAGS = ['docker', 'git', 'log', 'filter', 'network', 'k8s', 'gradle', 'maven', 'sql', 'windows'];
 
 function emptyForm() {
   return { intent: '', cmd: '', tags: '', project: '', notes: '', variantOf: null };
