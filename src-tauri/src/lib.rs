@@ -31,6 +31,7 @@ pub fn run_gui() {
         .manage(Db(Mutex::new(conn.into_inner())))
         .invoke_handler(tauri::generate_handler![
             commands::search,
+            commands::browse_docs,
             commands::get_snippet,
             commands::create_snippet,
             commands::update_snippet,

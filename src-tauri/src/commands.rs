@@ -25,6 +25,13 @@ pub fn search(
     search::search(&conn, &q, project.as_deref(), 50)
 }
 
+/// v1.4 文档库浏览：全源、分组、不截断（与 search 的相关性排序互补）。
+#[tauri::command]
+pub fn browse_docs(state: State<'_, Db>, q: String) -> Result<DocBrowse, String> {
+    let conn = lock(&state)?;
+    search::browse(&conn, &q, search::BROWSE_LIMIT)
+}
+
 #[tauri::command]
 pub fn get_snippet(state: State<'_, Db>, id: i64) -> Result<Option<Snippet>, String> {
     let conn = lock(&state)?;

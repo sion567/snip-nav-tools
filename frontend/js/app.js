@@ -30,6 +30,7 @@ const store = reactive({
   historyModal: { open: false, list: [], loading: false },
   aiLoading: false,
   docBody: { open: false, title: '', text: '', loading: false },
+  docBrowse: { open: false, q: '', loading: false, data: null },  // v1.4 文档库浏览
 });
 
 // 挂到 store 上的 computed（模板经 reactive 代理自动解包）
@@ -382,6 +383,31 @@ async function openDocBody(r) {
   }
 }
 
+// ---------- v1.4：文档库浏览（全源、分组、不截断；空查询=工具索引） ----------
+let docBrowseTimer = null;
+async function refreshDocBrowse() {
+  store.docBrowse.loading = true;
+  try {
+    store.docBrowse.data = await SNIP.invoke('browse_docs', { q: store.docBrowse.q });
+  } catch (e) {
+    showToast('文档库读取失败：' + e);
+  } finally {
+    store.docBrowse.loading = false;
+  }
+}
+function openDocBrowse(q) {
+  store.docBrowse.q = String(q !== undefined ? q : store.q).trim();
+  store.docBrowse.open = true;
+  refreshDocBrowse();
+}
+function closeDocBrowse() { store.docBrowse.open = false; }
+// 弹窗内搜索框防抖（开着的弹窗才响应输入）
+watch(() => store.docBrowse.q, () => {
+  if (!store.docBrowse.open) return;
+  clearTimeout(docBrowseTimer);
+  docBrowseTimer = setTimeout(refreshDocBrowse, 300);
+});
+
 async function refreshHistory() {
   try { store.historyModal.list = await SNIP.invoke('recent_history', { limit: 100 }); } catch (e2) { /* 忽略 */ }
 }
@@ -431,6 +457,7 @@ window.addEventListener('keydown', (e) => {
   } else if (e.key === 'Escape') {
     if (store.dialog.open) store.dialog.open = false;
     else if (store.settings.open) store.settings.open = false;
+    else if (store.docBrowse.open) closeDocBrowse();
     else if (store.panel) closePanel();
   }
 });
@@ -601,6 +628,50 @@ const DOC_TPL = `
 </div>
 `;
 
+// v1.4：文档库浏览——完整性视图（与搜索的相关性排序互补）
+const DOCBROWSE_TPL = `
+<div class="overlay" v-if="store.docBrowse.open" @click.self="closeDocBrowse">
+  <div class="modal doc-browse-modal">
+    <h3>📚 文档库</h3>
+    <div class="search-row">
+      <span class="s-icon">🔍</span>
+      <input v-model="store.docBrowse.q" placeholder="输入工具名或关键词，如：docker（多词是收窄）" />
+    </div>
+    <div v-if="store.docBrowse.loading && !store.docBrowse.data" class="muted pad">读取中…</div>
+    <template v-else-if="store.docBrowse.data">
+      <template v-if="!store.docBrowse.data.query">
+        <p class="muted small">库里的工具，点一个浏览它的全部文档：</p>
+        <div class="chips" v-if="store.docBrowse.data.tools.length">
+          <button class="chip" v-for="t in store.docBrowse.data.tools" :key="'tool-' + t.name" :title="t.name + ' 共 ' + t.count + ' 条'" @click="store.docBrowse.q = t.name">
+            {{t.name}} <b>{{t.count}}</b>
+          </button>
+        </div>
+        <div v-else class="muted pad">库还是空的——先存一条记录，或在设置里导入 tldr / 手册页。</div>
+      </template>
+      <template v-else-if="!store.docBrowse.data.groups.length">
+        <div class="muted pad">没有匹配「{{store.docBrowse.data.query}}」的记录</div>
+      </template>
+      <template v-else>
+        <div class="muted small">「{{store.docBrowse.data.query}}」共 {{store.docBrowse.data.total}} 条</div>
+        <div class="doc-group" v-for="g in store.docBrowse.data.groups" :key="'dg-' + g.key">
+          <h4>{{g.label}} · {{g.items.length}}</h4>
+          <div class="hist-row" v-for="s in g.items" :key="'dgi-' + g.key + '-' + s.id">
+            <div class="hist-main">
+              <code>{{s.cmd}}</code>
+              <span class="muted small">{{s.intent}}</span>
+            </div>
+            <button class="btn sm" title="复制命令（累计使用次数）" @click="copyResult(s)">📋</button>
+            <button v-if="s.source === 'doc'" class="btn sm" title="查看整页手册" @click="openDocBody(s)">📖 全文</button>
+          </div>
+        </div>
+        <div v-if="store.docBrowse.data.total >= 1000" class="muted small">已达浏览上限 1000 条，换个更具体的关键词</div>
+      </template>
+    </template>
+    <div class="row end"><button class="btn" @click="closeDocBrowse">关闭</button></div>
+  </div>
+</div>
+`;
+
 const HISTORY_TPL = `<div class="overlay" v-if="store.historyModal.open" @click.self="store.historyModal.open = false">
   <div class="modal">
     <h3>🕘 最近执行的命令</h3>
@@ -658,6 +729,8 @@ function sharedSetup() {
     adoptFromHistory,
     refreshHistory,
     openDocBody,
+    openDocBrowse,
+    closeDocBrowse,
     aiSuggest,
   };
 }
@@ -672,6 +745,7 @@ createApp({
     'settings-modal': { setup: sharedSetup, template: SETTINGS_TPL },
     'history-modal': { setup: sharedSetup, template: HISTORY_TPL },
     'doc-body-modal': { setup: sharedSetup, template: DOC_TPL },
+    'doc-browse-modal': { setup: sharedSetup, template: DOCBROWSE_TPL },
   },
   template: `
 <div class="app">
@@ -680,6 +754,7 @@ createApp({
     <div class="top-actions">
       <button class="btn" :title="store.theme === 'dark' ? '切换到明亮模式' : '切换到暗黑模式'" @click="toggleTheme()">{{ store.theme === 'dark' ? '🌙' : '☀️' }}</button>
       <button class="btn" title="最近执行的命令" @click="openHistory()">🕘 历史</button>
+      <button class="btn" title="按来源浏览库里的全部文档" @click="openDocBrowse()">📚 文档库</button>
       <button class="btn" @click="openSettings()">⚙️ 设置</button>
       <button class="btn primary" @click="openCreate()">＋ 新记录</button>
     </div>
@@ -703,6 +778,9 @@ createApp({
 
   <main class="layout" :class="{ withPanel: !!store.panel }">
     <section class="results">
+      <div class="browse-entry" v-if="store.q.trim()">
+        <button class="chip" title="按来源分组浏览全部匹配文档（不截断）" @click="openDocBrowse(store.q)">📖 「{{store.q}}」的全部文档</button>
+      </div>
       <div v-if="store.searching" class="muted pad">搜索中…</div>
       <div v-else-if="!store.results.length" class="empty">
         <div>没有匹配的记录</div>
@@ -733,6 +811,7 @@ createApp({
   <settings-modal></settings-modal>
   <history-modal></history-modal>
   <doc-body-modal></doc-body-modal>
+  <doc-browse-modal></doc-browse-modal>
   <div class="toast" v-if="store.toast">{{store.toast}}</div>
 </div>
 `,

@@ -30,6 +30,26 @@ pub struct Hit {
     pub score: i64,
 }
 
+/// 文档库浏览：按来源分组的完整列表（v1.4）。
+/// 与 search 的分工——search 求相关性（权重排序 + 截断），browse 求完整性（全源、分组、不截断）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocGroup {
+    pub key: String, // self / ai / tldr / doc
+    pub label: String,
+    pub items: Vec<Snippet>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DocBrowse {
+    pub query: String,
+    pub total: i64,
+    pub groups: Vec<DocGroup>,
+    /// 空查询时的工具名索引（工具名 + 条数），作为浏览落地页
+    pub tools: Vec<TagCount>,
+}
+
 // ---------- 入参 ----------
 
 #[derive(Debug, Deserialize)]
@@ -112,7 +132,7 @@ pub struct Stats {
     pub data_dir: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TagCount {
     pub name: String,

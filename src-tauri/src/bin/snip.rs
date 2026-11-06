@@ -3,6 +3,7 @@
 //! 用法：
 //!   snip add "描述" "命令" [--tag a,b] [--project 名称] [--note 备注]
 //!   snip search "关键词" [--project 名称]
+//!   snip docs [关键词]        浏览全部相关文档（按来源分组），无参数=工具索引
 //!   snip list [--limit N]
 //!   snip stats
 //!   snip import-tldr <目录>
@@ -22,6 +23,7 @@ fn main() {
     let code = match cmd.as_str() {
         "add" => cmd_add(rest),
         "search" | "s" => cmd_search(rest),
+        "docs" => cmd_docs(rest),
         "list" | "ls" => cmd_list(rest),
         "stats" => cmd_stats(),
         "import-tldr" => cmd_import(rest),
@@ -51,6 +53,7 @@ fn print_help() {
         "snip - SnipNav 命令行\n\
          \x20 snip add \"描述\" \"命令\" [--tag a,b] [--project 名称] [--note 备注]\n\
          \x20 snip search \"关键词\" [--project 名称]\n\
+         \x20 snip docs [工具或关键词]          # 浏览全部相关文档（按来源分组）；无参数=工具索引\n\
          \x20 snip list [--limit N]\n\
          \x20 snip gen-params <工具> [子命令]   # 跑 --help 自动生成参数树\n\
          \x20 snip import-tldr <tldr仓库pages目录>\n\
@@ -196,6 +199,60 @@ fn cmd_search(args: &[String]) -> i32 {
             1
         }
     }
+}
+
+// ---------- v1.4：文档库浏览 ----------
+
+fn cmd_docs(args: &[String]) -> i32 {
+    let q = args.join(" ");
+    let conn = match db::open() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("打开数据库失败: {e}");
+            return 1;
+        }
+    };
+    let r = match search::browse(&conn, &q, search::BROWSE_LIMIT) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("浏览失败: {e}");
+            return 1;
+        }
+    };
+    if q.trim().is_empty() {
+        // 空查询：工具索引落地页
+        if r.tools.is_empty() {
+            println!("（库为空）");
+            return 0;
+        }
+        println!("库里的工具 —— snip docs <工具名> 浏览它的全部文档：");
+        for t in &r.tools {
+            println!("  {:<16} {:>4} 条", t.name, t.count);
+        }
+        return 0;
+    }
+    if r.total == 0 {
+        println!("（没有匹配「{}」的记录）", r.query);
+        return 0;
+    }
+    println!("「{}」共 {} 条：", r.query, r.total);
+    for g in &r.groups {
+        let mark = match g.key.as_str() {
+            "self" => "🟢",
+            "ai" => "🤖",
+            "tldr" => "📖",
+            _ => "📄",
+        };
+        println!("\n{} {}（{}条）", mark, g.label, g.items.len());
+        for s in &g.items {
+            println!("  [{:>4}] {}", s.id, s.intent);
+            println!("          {}", s.cmd);
+            if s.source == "doc" {
+                println!("          （手册页：snip search \"{}\" 后在 GUI 点「📖 全文」查看整页）", s.cmd);
+            }
+        }
+    }
+    0
 }
 
 fn cmd_list(args: &[String]) -> i32 {

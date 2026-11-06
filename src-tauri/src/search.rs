@@ -12,7 +12,7 @@ use chrono::{Local, NaiveDate};
 use rusqlite::{Connection, ToSql};
 
 use crate::db;
-use crate::models::{Hit, Snippet};
+use crate::models::{DocBrowse, DocGroup, Hit, Snippet, TagCount};
 
 /// 超过该行数且关键词适合 FTS 时，切换 FTS5 候选检索。
 pub const FTS_THRESHOLD: i64 = 20_000;
@@ -241,6 +241,125 @@ pub fn score(sn: &Snippet, keywords: &[String], project: Option<&str>) -> i64 {
     s
 }
 
+// ---------- v1.4：文档库浏览（完整性优先，与 search 并列） ----------
+
+/// 浏览上限：全源扫描 + 分组返回的封顶（单个工具的命中远小于此，纯防失控）。
+pub const BROWSE_LIMIT: usize = 1000;
+
+/// 分组固定顺序：个人资产在前，资料性内容在后。
+const DOC_SOURCES: &[(&str, &str)] = &[
+    ("self", "你的记录"),
+    ("ai", "AI 生成"),
+    ("tldr", "tldr 速查"),
+    ("doc", "手册文档"),
+];
+
+fn source_rank(source: &str) -> usize {
+    DOC_SOURCES
+        .iter()
+        .position(|(k, _)| *k == source)
+        .unwrap_or(DOC_SOURCES.len())
+}
+
+/// 文档库浏览：与 search 的分工——search 求相关性（OR 候选 + 权重排序 + 截断 top50），
+/// browse 求完整性（关键词 AND 收窄 + 来源分组 + 字母序，不按热度截断）。
+/// 字段匹配集与 CAND_COND 相同（8 路 LIKE 含标签子查询），但关键词之间是 AND——
+/// 浏览语义是「收窄」（docker logs = docker 且 logs），不是「发散」。
+pub fn browse(conn: &Connection, q: &str, limit: usize) -> Result<DocBrowse, String> {
+    let keywords: Vec<String> = q
+        .split_whitespace()
+        .map(|w| w.trim().to_lowercase())
+        .filter(|w| !w.is_empty())
+        .collect();
+
+    if keywords.is_empty() {
+        // 空查询：返回工具名索引作落地页（库里有哪些工具、各多少条）
+        return Ok(DocBrowse {
+            query: q.trim().to_string(),
+            total: 0,
+            groups: Vec::new(),
+            tools: tool_index(conn),
+        });
+    }
+
+    let conds: Vec<String> = keywords.iter().map(|_| CAND_COND.to_string()).collect();
+    let mut params: Vec<String> = Vec::new();
+    for kw in &keywords {
+        let like = format!("%{}%", escape_like(kw));
+        for _ in 0..7 {
+            params.push(like.clone());
+        }
+    }
+    let sql = format!("SELECT s.* FROM snippets s WHERE {}", conds.join(" AND "));
+    let refs: Vec<&dyn ToSql> = params.iter().map(|s| s as &dyn ToSql).collect();
+    let mut cands = db::query_snippets(conn, &sql, &refs)?;
+    attach_tags_batch(conn, &mut cands);
+
+    // 目录序：来源分组 → 工具 → 子命令 → 名称，读起来像一册目录
+    cands.sort_by(|a, b| {
+        source_rank(&a.source)
+            .cmp(&source_rank(&b.source))
+            .then_with(|| {
+                a.tool
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.tool.as_deref().unwrap_or(""))
+            })
+            .then_with(|| {
+                a.command
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(b.command.as_deref().unwrap_or(""))
+            })
+            .then_with(|| a.cmd.cmp(&b.cmd))
+            .then_with(|| a.intent.cmp(&b.intent))
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = cands.len() as i64;
+    cands.truncate(limit);
+    let mut groups: Vec<DocGroup> = Vec::new();
+    for (key, label) in DOC_SOURCES {
+        let items: Vec<Snippet> = cands
+            .iter()
+            .filter(|s| s.source == *key)
+            .cloned()
+            .collect();
+        if !items.is_empty() {
+            groups.push(DocGroup {
+                key: (*key).to_string(),
+                label: (*label).to_string(),
+                items,
+            });
+        }
+    }
+    Ok(DocBrowse {
+        query: keywords.join(" "),
+        total,
+        groups,
+        tools: Vec::new(),
+    })
+}
+
+/// 工具名索引（浏览落地页）：走 idx_snippets_tool 索引。
+fn tool_index(conn: &Connection) -> Vec<TagCount> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT tool AS name, COUNT(*) AS n FROM snippets
+         WHERE tool IS NOT NULL AND tool != ''
+         GROUP BY tool ORDER BY n DESC, name LIMIT 60",
+    ) else {
+        return Vec::new();
+    };
+    stmt.query_map([], |r| {
+        Ok(TagCount {
+            name: r.get("name")?,
+            count: r.get("n")?,
+        })
+    })
+    .map(|rows| rows.flatten().collect())
+    .unwrap_or_default()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +469,62 @@ mod tests {
         // 中文 / 短词必须回退 LIKE
         assert!(fts_match_query(&["日志".into()]).is_none());
         assert!(fts_match_query(&["ab".into()]).is_none());
+    }
+
+    #[test]
+    fn browse_groups_sources_in_fixed_order() {
+        let conn = setup();
+        // 插入顺序故意打乱，验证分组顺序与组内字母序与插入无关
+        add(&conn, "docker logs 末尾 100 行", "docker logs --tail 100 -t web", None, "self", 9, None);
+        add(&conn, "实时跟随最新输出", "docker logs -f --tail 100 {{容器}}", None, "tldr", 0, None);
+        add(&conn, "docker：手册页", "docker", None, "doc", 0, None);
+        add(&conn, "（AI）docker 清理镜像", "docker image prune -a", None, "ai", 0, None);
+        add(&conn, "git 提交记录", "git commit -m x", None, "self", 1, None);
+
+        let r = browse(&conn, "docker", BROWSE_LIMIT).unwrap();
+        assert_eq!(r.total, 4);
+        assert!(r.tools.is_empty(), "有关键词时不返回工具索引");
+        let keys: Vec<&str> = r.groups.iter().map(|g| g.key.as_str()).collect();
+        assert_eq!(keys, vec!["self", "ai", "tldr", "doc"], "来源固定顺序，空组不出现");
+        assert_eq!(r.groups[0].label, "你的记录");
+        // 组内按 cmd 字母序：--tail 100 在 -f 之前
+        assert_eq!(r.groups[0].items[0].cmd, "docker logs --tail 100 -t web");
+        // 高使用量不影响浏览排序（browse 不做权重排序）
+        assert_eq!(r.groups[2].items[0].source, "tldr");
+    }
+
+    #[test]
+    fn browse_multi_keyword_narrows() {
+        let conn = setup();
+        add(&conn, "docker logs 跟随输出", "docker logs -f web", None, "tldr", 0, None);
+        add(&conn, "docker ps 列表", "docker ps -a", None, "tldr", 0, None);
+        let r = browse(&conn, "docker logs", BROWSE_LIMIT).unwrap();
+        assert_eq!(r.total, 1, "多关键词是 AND 收窄，不是 OR 发散");
+        assert_eq!(r.groups[0].items[0].cmd, "docker logs -f web");
+    }
+
+    #[test]
+    fn browse_empty_query_returns_tool_index() {
+        let conn = setup();
+        add(&conn, "docker logs 跟随", "docker logs -f web", None, "self", 1, None);
+        add(&conn, "docker ps 列表", "docker ps -a", None, "self", 1, None);
+        add(&conn, "git log", "git log --oneline", None, "self", 1, None);
+
+        let r = browse(&conn, "", BROWSE_LIMIT).unwrap();
+        assert!(r.groups.is_empty());
+        assert_eq!(r.total, 0);
+        assert_eq!(r.tools[0].name, "docker", "条数最多的工具在前");
+        assert_eq!(r.tools[0].count, 2);
+        assert!(r.tools.iter().any(|t| t.name == "git"));
+    }
+
+    #[test]
+    fn browse_matches_by_tag() {
+        let conn = setup();
+        // cmd/intent 都不含关键词，只有标签能命中（kubectl → k8s 标签）
+        add(&conn, "看容器日志尾部", "kubectl logs -f pod", None, "self", 1, None);
+        let r = browse(&conn, "k8s", BROWSE_LIMIT).unwrap();
+        assert_eq!(r.total, 1, "标签字段必须参与浏览匹配");
+        assert!(!r.groups[0].items[0].tags.is_empty());
     }
 }

@@ -118,6 +118,37 @@
         if (kws.length) list.sort((a, b) => b.score - a.score || b.sn.usedCount - a.sn.usedCount);
         return list.slice(0, 50).map(({ sn, score }) => Object.assign(cloneSn(sn), { score }));
       }
+      case 'browse_docs': {
+        // v1.4 文档库浏览 Mock：与 Rust browse 同语义（AND 收窄、来源分组、字母序）
+        const kws = (args.q || '').split(/\s+/).map((w) => w.trim().toLowerCase()).filter(Boolean);
+        if (!kws.length) {
+          const cnt = {};
+          M.snippets.forEach((s) => { if (s.tool) cnt[s.tool] = (cnt[s.tool] || 0) + 1; });
+          const tools = Object.keys(cnt)
+            .map((name) => ({ name, count: cnt[name] }))
+            .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+            .slice(0, 60);
+          return { query: (args.q || '').trim(), total: 0, groups: [], tools };
+        }
+        const matched = M.snippets.filter((sn) => kws.every((kw) =>
+          (sn.intent || '').toLowerCase().includes(kw) || (sn.cmd || '').toLowerCase().includes(kw) ||
+          (sn.notes || '').toLowerCase().includes(kw) || ((sn.tool || '') + ' ' + (sn.command || '')).toLowerCase().includes(kw) ||
+          (sn.project || '').toLowerCase().includes(kw) || (sn.tags || []).some((t) => t.includes(kw))));
+        const order = { self: 0, ai: 1, tldr: 2, doc: 3 };
+        const labels = { self: '你的记录', ai: 'AI 生成', tldr: 'tldr 速查', doc: '手册文档' };
+        const sorted = matched.slice().sort((a, b) =>
+          ((order[a.source] ?? 9) - (order[b.source] ?? 9)) ||
+          (a.tool || '').localeCompare(b.tool || '') ||
+          (a.command || '').localeCompare(b.command || '') ||
+          (a.cmd || '').localeCompare(b.cmd || '') ||
+          (a.intent || '').localeCompare(b.intent || ''));
+        const groups = [];
+        for (const key of Object.keys(order)) {
+          const items = sorted.filter((s) => s.source === key).map(cloneSn);
+          if (items.length) groups.push({ key, label: labels[key], items });
+        }
+        return { query: kws.join(' '), total: sorted.length, groups, tools: [] };
+      }
       case 'get_snippet':
         return cloneSn(M.snippets.find((s) => s.id === args.id) || null);
       case 'create_snippet': {

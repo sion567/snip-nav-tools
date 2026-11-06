@@ -17,6 +17,7 @@
 - 🤝 **团队共享**（v0.4）：`snip export share.json` 导出个人记录，队友 `snip import-share share.json` 智能合并（同命令保留较大使用量、合并标签）
 - 🤖 **AI 兜底**（v0.5，**默认关闭**）：设置里显式开启并配好 Key 后，搜索无结果时一键让大模型生成（OpenAI 兼容接口，默认 GLM），自动入库打 🤖 徽标、可删；不开启则完全不调用
 - 📚 **批量手册导入**（v1.1）：`snip import-docs <目录>` 导入 man 等纯文本手册页——页名+简介作可搜索记录，整页原文存旁表（点「📖 全文」查看，不占搜索索引），选项段落自动并入参数树
+- 📚 **文档库浏览**（v1.4）：顶栏「📚 文档库」或搜索结果上的「📖 全部文档」——按来源分组（你的记录 / AI / tldr / 手册）列出关键词命中的**全部**条目，不按热度截断；空查询展示工具索引（库里有哪些工具、各多少条）。CLI 同款 `snip docs docker`
 - 📌 **托盘 + 开机自启 + 安装包**（v1.x）：关窗隐藏到托盘；设置里可开自启；`tauri build` 出 NSIS 安装包
 - 📖 **tldr 中文速查**：内置 10 页种子（grep/curl/tar/jq/docker logs/mvn/gradle/sqlite3/mysql/psql）；支持导入任意 tldr 格式仓库（官方英文库或社区中文翻译版）
 - 🖥 **CLI 伴随工具**：终端里一行存命令、搜命令
@@ -50,6 +51,10 @@ snip add "打包前端" "pnpm build" --project tools-help --note "记得先装�
 # 搜（可限项目）
 snip search "docker 日志"
 snip search "端口" --project tools-help
+
+# 浏览某工具的全部文档（按来源分组，不截断）；无参数 = 工具索引
+snip docs docker
+snip docs
 
 # 新工具参数树：跑 --help 自动生成（增量，可重复）
 snip gen-params git log

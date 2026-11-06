@@ -169,6 +169,13 @@ html[data-theme="light"] .badge.ai { color: #8250df; }
   padding: 12px 14px; font-family: var(--mono); font-size: 12px; line-height: 1.5;
   white-space: pre-wrap; word-break: break-word; color: var(--cmd-text);
 }
+
+/* v1.4 文档库浏览 */
+.doc-browse-modal { width: 760px; }
+.browse-entry { margin-bottom: -2px; }
+.browse-entry .chip { padding: 3px 12px; font-size: 12.5px; }
+.doc-group h4 { color: var(--muted); font-size: 13px; margin: 12px 0 6px; }
+.chip b { color: var(--accent); font-weight: 600; margin-left: 2px; }
 .hist-list { display: flex; flex-direction: column; gap: 6px; max-height: 55vh; overflow-y: auto; }
 .hist-row {
   display: flex; align-items: center; gap: 10px;
