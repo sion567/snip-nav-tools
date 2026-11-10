@@ -144,6 +144,27 @@ body {
 .badge.tldr { color: var(--blue); }
 .badge.ai { color: #d2a8ff; }
 html[data-theme="light"] .badge.ai { color: #8250df; }
+.badge.pinned { color: var(--yellow, #e3b341); }
+html[data-theme="light"] .badge.pinned { color: #9a6700; }
+/* v1.6 危险命令标注 */
+.badge.danger { color: var(--red); }
+/* v1.6 剪贴板待入库横幅 */
+.clip-banner {
+  display: flex; align-items: center; gap: 10px;
+  margin: 0 18px; padding: 8px 12px;
+  border: 1px dashed var(--accent); border-radius: 8px;
+  background: var(--accent-dim);
+}
+.clip-banner .cb-label { flex-shrink: 0; font-size: 12.5px; }
+.clip-banner .cb-cmd {
+  flex: 1; min-width: 0;
+  font-family: var(--mono); font-size: 12px; color: var(--cmd-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  user-select: text;
+}
+/* v1.5 收藏置顶卡片：左侧金色竖线提示 */
+.card.pinned { border-left: 3px solid var(--yellow, #e3b341); }
+.btn.on { border-color: var(--accent); color: var(--accent); background: var(--accent-dim); }
 
 /* 历史弹窗 */
 /* 开关行：显式横向排列（.modal label 的 column 权重更高，需用 .modal 前缀压回） */
@@ -240,7 +261,82 @@ html[data-theme="light"] .badge.ai { color: #8250df; }
   display: flex; flex-direction: column; gap: 8px;
 }
 .composed { border-color: var(--accent); }
+/* v1.5 占位符填空 */
+.ph-composer { border-style: dashed; background: none; }
+.ph-row { display: flex; align-items: center; gap: 8px; }
+.ph-row .ph-token {
+  flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis;
+  font-family: var(--mono); font-size: 12.5px; color: var(--code-blue);
+}
+.ph-row input {
+  flex: 1; min-width: 0;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); padding: 5px 9px; font-size: 13px; font-family: var(--mono);
+  outline: none;
+}
+.ph-row input:focus { border-color: var(--accent); }
+/* v1.7 动态变量行（date/time/year，只读展示） */
+.ph-row .ph-auto {
+  flex: 1; min-width: 0;
+  font-size: 12.5px; color: var(--text);
+  background: var(--bg); border: 1px dashed var(--border); border-radius: 6px;
+  padding: 5px 9px;
+}
 .group h4 { color: var(--muted); font-size: 13px; margin-bottom: 6px; }
+/* v1.7 Playbook 运行手册 */
+.pb-modal { width: 720px; }
+.pb-item {
+  border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.pb-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pb-step {
+  display: flex; align-items: center; gap: 8px;
+  background: var(--bg); border-radius: 6px; padding: 5px 9px;
+}
+.pb-no {
+  flex-shrink: 0; width: 20px; height: 20px; border-radius: 50%;
+  background: var(--accent-dim); color: var(--accent);
+  font-size: 12px; display: flex; align-items: center; justify-content: center;
+}
+.pb-cmd {
+  flex: 1; min-width: 0;
+  font-family: var(--mono); font-size: 12px; color: var(--cmd-text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  user-select: text;
+}
+.pb-pick { display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+.pb-pick .pb-step { background: var(--bg2); border: 1px solid var(--border); }
+/* v1.9 使用热力图 */
+.heat-modal { width: 780px; }
+.heat-scroll { overflow-x: auto; padding-bottom: 4px; }
+.heat-grid { display: flex; gap: 3px; align-items: flex-end; }
+.heat-col { display: flex; flex-direction: column; gap: 3px; }
+.heat-month-label {
+  height: 15px; font-size: 10px; color: var(--muted);
+  display: flex; align-items: center; white-space: nowrap;
+}
+.heat-cell {
+  width: 12px; height: 12px; border-radius: 2.5px; display: inline-block;
+  background: var(--bg3);
+}
+.heat-cell.h0 { background: var(--bg3); }
+.heat-cell.h1 { background: var(--accent); opacity: 0.25; }
+.heat-cell.h2 { background: var(--accent); opacity: 0.45; }
+.heat-cell.h3 { background: var(--accent); opacity: 0.7; }
+.heat-cell.h4 { background: var(--accent); opacity: 1; }
+.heat-legend { display: flex; align-items: center; gap: 3px; }
+/* v1.7 命令逐段解释 */
+.ex-seg {
+  display: flex; flex-wrap: wrap; gap: 4px 6px; align-items: baseline;
+  padding: 7px 9px; border-radius: 6px; background: var(--bg);
+  font-family: var(--mono); font-size: 12.5px; color: var(--cmd-text);
+  user-select: text;
+}
+.ex-part { word-break: break-all; }
+.ex-part.known { border-bottom: 1px dotted var(--accent); cursor: help; }
+.ex-part.unknown { border-bottom: 1px dotted var(--yellow, #e3b341); cursor: help; }
+.ex-pipe { color: var(--muted); user-select: text; }
 .param, .related {
   display: flex; align-items: baseline; gap: 10px;
   padding: 6px 8px; border-radius: 6px; border: 1px solid transparent;

@@ -128,9 +128,20 @@ pub fn update_snippet(
     };
 
     conn.execute(
-        "UPDATE snippets SET intent = ?1, cmd = ?2, notes = ?3, project = ?4,
-                            tool = ?5, command = ?6 WHERE id = ?7",
-        params![intent, cmd, notes, project, tool, command, id],
+        "UPDATE snippets SET intent = ?1, intent_py = ?2, intent_pyi = ?3,
+                            cmd = ?4, notes = ?5, project = ?6,
+                            tool = ?7, command = ?8 WHERE id = ?9",
+        params![
+            intent,
+            tagging::pinyin_full(&intent),
+            tagging::pinyin_initials(&intent),
+            cmd,
+            notes,
+            project,
+            tool,
+            command,
+            id
+        ],
     )
     .map_err(|e| e.to_string())?;
 
@@ -153,6 +164,23 @@ pub fn delete_snippet(state: State<'_, Db>, id: i64) -> Result<(), String> {
         return Err("记录不存在".into());
     }
     Ok(())
+}
+
+/// v1.5 收藏置顶：卡片 📌 一键切换，排序权重恒置顶。
+#[tauri::command]
+pub fn set_pinned(state: State<'_, Db>, id: i64, pinned: bool) -> Result<Snippet, String> {
+    let conn = lock(&state)?;
+    let n = conn
+        .execute(
+            "UPDATE snippets SET pinned = ?1 WHERE id = ?2",
+            params![pinned as i64, id],
+        )
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("记录不存在".into());
+    }
+    db::log_interaction(&conn, id, if pinned { "pin" } else { "unpin" });
+    db::load_snippet(&conn, id)?.ok_or_else(|| "读取失败".into())
 }
 
 /// 结果卡「复制」：剪贴板由前端单独调用 copy_to_clipboard 写入，
@@ -324,6 +352,168 @@ pub fn generate_params(
 }
 
 /// 顶栏徽标读真实版本（单一来源 tauri.conf.json，避免硬编码漂移）。
+// ---------- v1.7：Playbook 运行手册 ----------
+
+fn load_playbook(conn: &Connection, id: i64) -> Result<Playbook, String> {
+    let (name, note, created) = conn
+        .query_row(
+            "SELECT name, note, IFNULL(created,'') FROM playbooks WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .map_err(|_| "手册不存在".to_string())?;
+    let mut steps = db::query_snippets(
+        conn,
+        "SELECT s.* FROM snippets s JOIN playbook_items pi ON pi.snippet_id = s.id
+         WHERE pi.playbook_id = ?1 ORDER BY pi.position, pi.id",
+        &[&id as &dyn rusqlite::ToSql],
+    )?;
+    for s in steps.iter_mut() {
+        db::attach_tags(conn, s);
+    }
+    Ok(Playbook { id, name, note, created, steps })
+}
+
+/// 全部手册（按 id 倒序 = 新建的在前），steps 按 position 序带出。
+#[tauri::command]
+pub fn playbooks(state: State<'_, Db>) -> Result<Vec<Playbook>, String> {
+    let conn = lock(&state)?;
+    let ids: Vec<i64> = conn
+        .prepare("SELECT id FROM playbooks ORDER BY id DESC")
+        .map_err(|e| e.to_string())?
+        .query_map([], |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .collect();
+    ids.iter().map(|&id| load_playbook(&conn, id)).collect()
+}
+
+/// 新建/编辑手册：step_ids 顺序即步骤顺序，替换式重写步骤。
+#[tauri::command]
+pub fn playbook_save(state: State<'_, Db>, payload: PlaybookInput) -> Result<Playbook, String> {
+    let conn = lock(&state)?;
+    let name = payload.name.trim();
+    if name.is_empty() {
+        return Err("手册名称不能为空".into());
+    }
+    let id = match payload.id {
+        Some(id) => {
+            let note = payload.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            let n = conn
+                .execute(
+                    "UPDATE playbooks SET name = ?2, note = ?3 WHERE id = ?1",
+                    params![id, name, note],
+                )
+                .map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("手册不存在".into());
+            }
+            id
+        }
+        None => {
+            let note = payload.note.as_deref().map(str::trim).filter(|s| !s.is_empty());
+            conn.execute(
+                "INSERT INTO playbooks(name, note) VALUES (?1, ?2)",
+                params![name, note],
+            )
+            .map_err(|e| e.to_string())?;
+            conn.last_insert_rowid()
+        }
+    };
+    conn.execute("DELETE FROM playbook_items WHERE playbook_id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    for (pos, sid) in payload.step_ids.iter().enumerate() {
+        conn.execute(
+            "INSERT INTO playbook_items(playbook_id, snippet_id, position) VALUES (?1, ?2, ?3)",
+            params![id, sid, pos as i64],
+        )
+        .map_err(|e| format!("步骤写入失败（记录 #{} 可能已被删除）: {e}", sid))?;
+    }
+    load_playbook(&conn, id)
+}
+
+#[tauri::command]
+pub fn playbook_delete(state: State<'_, Db>, id: i64) -> Result<(), String> {
+    let conn = lock(&state)?;
+    // items 由外键级联删除
+    let n = conn
+        .execute("DELETE FROM playbooks WHERE id = ?1", [id])
+        .map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("手册不存在".into());
+    }
+    Ok(())
+}
+
+// ---------- v1.8：复制并粘贴回原窗口 ----------
+
+pub const KEY_QUICK_PASTE: &str = "quick_paste";
+
+/// 浮窗 Enter（粘贴模式开启时）：写剪贴板 → 藏浮窗（焦点自然回到呼出前的
+/// 窗口）→ 320ms 后向目标窗口模拟 Ctrl+V。终端里仍由用户自己按回车执行。
+#[tauri::command]
+pub fn paste_and_hide(
+    app: tauri::AppHandle,
+    target: State<'_, crate::paste::PasteTarget>,
+    text: String,
+) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| format!("打开剪贴板失败: {e}"))?;
+    cb.set_text(text).map_err(|e| format!("写入剪贴板失败: {e}"))?;
+    {
+        use tauri::Manager;
+        if let Some(w) = app.get_webview_window("quick") {
+            let _ = w.hide();
+        }
+    }
+    let hwnd = target
+        .0
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?
+        .clone();
+    crate::paste::send_paste(hwnd);
+    Ok(())
+}
+
+/// v1.9 使用热力图：近一年每天的动作次数（复制/组合/保存变体/收藏）。
+#[tauri::command]
+pub fn heatmap(state: State<'_, Db>) -> Result<Vec<DayCount>, String> {
+    let conn = lock(&state)?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT date(created) AS d, COUNT(*) FROM interactions
+             WHERE date(created) >= date('now', '-1 year', 'localtime')
+             GROUP BY d ORDER BY d",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(DayCount {
+                date: r.get(0)?,
+                count: r.get(1)?,
+            })
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(rows.flatten().collect())
+}
+
+#[tauri::command]
+pub fn import_workflows(state: State<'_, Db>, path: String) -> Result<WorkflowImportResult, String> {
+    let conn = lock(&state)?;
+    let p = importer::expand_path(&path);
+    crate::workflows::import_path(&conn, &p)
+}
+
+/// v1.10：探测端点上的模型列表（设置页「检测本地 Ollama」用，前端传当前填的 base_url）。
+/// 纯网络请求不持锁。
+#[tauri::command]
+pub fn llm_models(base_url: String) -> Result<Vec<String>, String> {
+    let b = base_url.trim();
+    if b.is_empty() {
+        return Err("先填 API Base URL".into());
+    }
+    crate::llm::list_models(b)
+}
+
 #[tauri::command]
 pub fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
@@ -364,6 +554,56 @@ pub fn llm_suggest(state: State<'_, Db>, q: String) -> Result<Vec<Snippet>, Stri
     crate::llm::store(&conn, &items)
 }
 
+// ---------- v1.5：速查浮窗 ----------
+
+pub const KEY_QUICK_HOTKEY: &str = "quick_hotkey";
+
+/// quick 页复制完成后 / Esc 时自行隐藏浮窗。
+#[tauri::command]
+pub fn quick_hide(app: tauri::AppHandle) -> Result<(), String> {
+    use tauri::Manager;
+    if let Some(w) = app.get_webview_window("quick") {
+        let _ = w.hide();
+    }
+    Ok(())
+}
+
+/// 设置页修改全局快捷键：立即重注册并持久化（空串 = 禁用快捷键）。
+#[tauri::command]
+pub fn set_quick_hotkey(
+    app: tauri::AppHandle,
+    state: State<'_, Db>,
+    hotkey: String,
+) -> Result<(), String> {
+    let h = hotkey.trim().to_string();
+    crate::register_quick_hotkey(&app, &h)?;
+    let conn = lock(&state)?;
+    db::set_setting(&conn, KEY_QUICK_HOTKEY, &h)
+}
+
+// ---------- v1.6：剪贴板监听 ----------
+
+/// 前端轮询取「待入库」的剪贴板命令（无则 None）。peek 语义：展示中不被清掉。
+#[tauri::command]
+pub fn pending_clipboard(state: State<'_, crate::clipboard::Pending>) -> Result<Option<crate::clipboard::PendingCmd>, String> {
+    let p = state
+        .0
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    Ok(p.clone())
+}
+
+/// 用户点「忽略」或保存成功后清掉待入库命令。
+#[tauri::command]
+pub fn dismiss_pending_clipboard(state: State<'_, crate::clipboard::Pending>) -> Result<(), String> {
+    let mut p = state
+        .0
+        .lock()
+        .map_err(|e| format!("状态锁异常: {e}"))?;
+    *p = None;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn get_settings(state: State<'_, Db>) -> Result<std::collections::HashMap<String, String>, String> {
     let conn = lock(&state)?;
@@ -373,6 +613,9 @@ pub fn get_settings(state: State<'_, Db>) -> Result<std::collections::HashMap<St
         crate::llm::KEY_BASE_URL,
         crate::llm::KEY_API_KEY,
         crate::llm::KEY_MODEL,
+        KEY_QUICK_HOTKEY,
+        KEY_QUICK_PASTE,
+        crate::clipboard::KEY_CLIPBOARD_WATCH,
     ] {
         if let Some(v) = db::get_setting(&conn, key) {
             out.insert(key.to_string(), v);
@@ -393,6 +636,8 @@ pub fn save_settings(
         crate::llm::KEY_BASE_URL,
         crate::llm::KEY_API_KEY,
         crate::llm::KEY_MODEL,
+        crate::clipboard::KEY_CLIPBOARD_WATCH,
+        KEY_QUICK_PASTE,
     ] {
         if let Some(v) = values.get(key) {
             db::set_setting(&conn, key, v.trim())?;

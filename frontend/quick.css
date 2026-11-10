@@ -1,0 +1,42 @@
+/* 速查浮窗（quick.html）——复用主题变量，紧凑布局覆盖 */
+
+body.quick { overflow: hidden; }
+
+.q-wrap { display: flex; flex-direction: column; height: 100vh; }
+
+.q-search {
+  display: flex; align-items: center; gap: 10px;
+  padding: 13px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg2);
+}
+.q-search .s-icon { font-size: 15px; }
+.q-search input {
+  flex: 1; min-width: 0;
+  background: none; border: none; outline: none;
+  color: var(--text); font-size: 16px; font-family: inherit;
+}
+.q-search input::placeholder { color: var(--muted); }
+.q-hint { color: var(--muted); font-size: 11px; white-space: nowrap; }
+
+.q-results {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 10px;
+  display: flex; flex-direction: column; gap: 6px;
+}
+.qr {
+  border: 1px solid transparent; border-radius: 8px;
+  padding: 8px 10px; cursor: pointer;
+}
+.qr:hover, .qr.active { border-color: var(--accent); background: var(--accent-dim); }
+.qr.copied { border-color: var(--accent); }
+.qr-top { display: flex; align-items: center; gap: 8px; margin-bottom: 2px; }
+.q-mark { font-size: 12px; flex-shrink: 0; }
+.q-intent {
+  flex: 1; min-width: 0;
+  font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.q-copied { color: var(--accent); font-size: 12px; flex-shrink: 0; }
+.q-warn { font-size: 12px; flex-shrink: 0; }
+.qr .cmd { font-size: 12px; max-height: 3.8em; overflow: hidden; }
+.q-more { text-align: center; }

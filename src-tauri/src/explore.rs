@@ -3,7 +3,7 @@
 use rusqlite::{params, Connection, ToSql};
 
 use crate::db;
-use crate::models::{ExplorePanel, ParamGroup, ParamItem, Pattern, Snippet};
+use crate::models::{CmdPart, ExplainSeg, ExplorePanel, ParamGroup, ParamItem, Pattern, Snippet};
 
 /// 分组展示顺序（未知分类排最后，label 用原值）。
 pub const CATEGORY_LABELS: &[(&str, &str)] = &[
@@ -48,6 +48,115 @@ pub fn record_pattern(conn: &Connection, base_cmd: &str, suffix: &str) -> Result
     )
     .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+// ---------- v1.7：命令解释（explainshell 式） ----------
+
+use std::collections::HashMap;
+
+/// 加载某工具的 flag → 描述映射。
+/// `command` 为 Some 时只收该子命令的参数树，查不到再回落到工具级（command=''）；
+/// 不跨子命令取条目（docker ps 的 -a 不该解释 docker logs 的 -a）。
+/// flag 字段形如 "--tail <N>" / "-t, --timestamps" / "--grep=<关键字>"，
+/// 按逗号/空白拆出以 - 开头的候选名。
+fn flag_desc_map(conn: &Connection, tool: &str, command: Option<&str>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    if tool.is_empty() {
+        return map;
+    }
+    let Ok(mut stmt) =
+        conn.prepare("SELECT IFNULL(command,'') AS c, IFNULL(flag,'') AS f, IFNULL(\"desc\",'') AS d FROM param_tree WHERE tool = ?1")
+    else {
+        return map;
+    };
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map(params![tool], |r| {
+            Ok((r.get("c")?, r.get("f")?, r.get("d")?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+    for (c, f, d) in rows {
+        // 子命令级：仅当与目标子命令一致；工具级：command 为空字符串
+        let take = match command {
+            Some(k) => c == k || c.is_empty(),
+            None => c.is_empty(),
+        };
+        if !take {
+            continue;
+        }
+        for cand in f.split([',', ' ', '\t']) {
+            let cand = cand.trim();
+            // 剥掉 =<值> 形式（--tail=<N> → --tail），候选名只留旗标本身
+            let cand = cand.split('=').next().unwrap_or(cand).trim();
+            if cand.starts_with('-') && cand.len() >= 2 {
+                // 子命令专属描述优先于工具级：已有条目时仅子命令级行才覆盖
+                map.entry(cand.to_string())
+                    .and_modify(|v| {
+                        if !c.is_empty() {
+                            *v = d.clone();
+                        }
+                    })
+                    .or_insert_with(|| d.clone());
+            }
+        }
+    }
+    map
+}
+
+/// 解释单个 token：--flag=value 查 --flag；合并短旗标 -ft 逐字符查并拼合描述；
+/// 其余片段（工具名、参数值）desc 为 None。
+fn explain_token(tok: &str, map: &HashMap<String, String>) -> CmdPart {
+    if let Some(rest) = tok.strip_prefix("--") {
+        let name = rest.split('=').next().unwrap_or(rest);
+        let desc = map.get(&format!("--{name}")).cloned();
+        return CmdPart { text: tok.to_string(), desc };
+    }
+    if let Some(rest) = tok.strip_prefix('-') {
+        if !rest.is_empty() && !rest.starts_with('-') && rest.len() > 1 {
+            let mut descs = Vec::new();
+            for c in rest.chars() {
+                let key = format!("-{c}");
+                if let Some(d) = map.get(&key) {
+                    descs.push(format!("{key}：{d}"));
+                }
+            }
+            let desc = if descs.is_empty() { None } else { Some(descs.join("；")) };
+            return CmdPart { text: tok.to_string(), desc };
+        }
+        return CmdPart {
+            desc: map.get(tok).cloned(),
+            text: tok.to_string(),
+        };
+    }
+    CmdPart { text: tok.to_string(), desc: None }
+}
+
+/// 把命令按 | 分段逐段解释；每段工具取首 token（./gradlew 归一为 gradle），
+/// 第二个 token 非参数时视为子命令用于精准匹配参数树。
+pub fn build_explain(conn: &Connection, cmd: &str) -> Vec<ExplainSeg> {
+    let mut segs = Vec::new();
+    for seg in cmd.split('|') {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        let toks: Vec<&str> = seg.split_whitespace().collect();
+        let tool = toks
+            .first()
+            .map(|t| match *t {
+                "./gradlew" | "gradlew" => "gradle".to_string(),
+                t => t.to_lowercase(),
+            })
+            .unwrap_or_default();
+        let subcmd = toks
+            .get(1)
+            .filter(|t| !t.starts_with('-'))
+            .map(|t| t.to_string());
+        let map = flag_desc_map(conn, &tool, subcmd.as_deref());
+        let parts = toks.iter().map(|t| explain_token(t, &map)).collect();
+        segs.push(ExplainSeg { tool, parts });
+    }
+    segs
 }
 
 pub fn get_explore(conn: &Connection, id: i64) -> Result<Option<ExplorePanel>, String> {
@@ -163,12 +272,16 @@ pub fn get_explore(conn: &Connection, id: i64) -> Result<Option<ExplorePanel>, S
         db::attach_tags(conn, r);
     }
 
+    // 4) v1.7 命令逐段解释
+    let explain = build_explain(conn, &base.cmd);
+
     Ok(Some(ExplorePanel {
         base,
         base_name,
         groups,
         patterns,
         related,
+        explain,
     }))
 }
 
@@ -208,6 +321,51 @@ mod tests {
         assert!(keys.contains(&"pipe"), "应有管道过滤组: {keys:?}");
         assert!(!panel.patterns.is_empty(), "种子常用组合应出现");
         assert!(!panel.related.is_empty());
+    }
+
+    #[test]
+    fn explain_annotates_flags_and_pipes() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::seeds::seed_all(&conn).unwrap();
+
+        // kubectl logs -fn --tail=100（种子有 -f/-n/--tail 描述）| grep -in error
+        let segs = build_explain(&conn, "kubectl logs -fn my-pod --tail=100 | grep -in error");
+        assert_eq!(segs.len(), 2, "按管道分两段");
+        assert_eq!(segs[0].tool, "kubectl");
+        assert_eq!(segs[1].tool, "grep");
+
+        // kubectl 段：-fn 逐字符拆出 -f/-n 的描述合并；--tail=100 命中 --tail
+        let fn_tok = segs[0].parts.iter().find(|p| p.text == "-fn").expect("应有 -fn 片段");
+        let d = fn_tok.desc.as_deref().unwrap_or("");
+        assert!(d.contains("-f") && d.contains("-n"), "合并短旗标描述应含两者: {d}");
+        let tail = segs[0].parts.iter().find(|p| p.text == "--tail=100").expect("应有 --tail=100");
+        assert_eq!(tail.desc.as_deref(), Some("尾部 N 行"));
+        // 工具名/普通参数不带描述
+        let pod = segs[0].parts.iter().find(|p| p.text == "my-pod").expect("应有 my-pod");
+        assert_eq!(pod.desc, None);
+
+        // grep 段：-in 是合并短旗标（种子有 -i/-n 描述）
+        let in_tok = segs[1].parts.iter().find(|p| p.text == "-in").expect("应有 -in");
+        let d2 = in_tok.desc.as_deref().unwrap_or("");
+        assert!(d2.contains("忽略大小写") && d2.contains("显示行号"), "grep 段应命中种子描述: {d2}");
+    }
+
+    #[test]
+    fn explain_no_cross_subcommand_contamination() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        crate::seeds::seed_all(&conn).unwrap();
+
+        // docker ps -a：-a 只在 docker ps 的参数树里有，解释 docker ps 时命中，
+        // 解释 docker logs 时不应串到（logs 的参数树没有 -a）
+        let segs = build_explain(&conn, "docker ps -a");
+        let a = segs[0].parts.iter().find(|p| p.text == "-a").unwrap();
+        assert_eq!(a.desc.as_deref(), Some("显示已停止的容器"));
+
+        let segs2 = build_explain(&conn, "docker logs -a web");
+        let a2 = segs2[0].parts.iter().find(|p| p.text == "-a").unwrap();
+        assert_eq!(a2.desc, None, "logs 参数树没有 -a，不应借用 ps 的描述");
     }
 
     #[test]

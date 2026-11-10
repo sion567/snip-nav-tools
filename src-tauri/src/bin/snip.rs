@@ -29,12 +29,15 @@ fn main() {
         "import-tldr" => cmd_import(rest),
         "gen-params" => cmd_gen_params(rest),
         "import-docs" => cmd_import_docs(rest),
+        "import-workflows" => cmd_import_workflows(rest),
         "vacuum" => cmd_vacuum(),
         "hook" => cmd_hook(rest),
         "history" => cmd_history(rest),
         "adopt" => cmd_adopt(rest),
         "export" => cmd_export(rest),
         "import-share" => cmd_import_share(rest),
+        "pin" => cmd_pin(rest),
+        "sync" => cmd_sync(rest),
         "delete" | "rm" => cmd_delete(rest),
         "help" | "--help" | "-h" | "" => {
             print_help();
@@ -58,11 +61,14 @@ fn print_help() {
          \x20 snip gen-params <工具> [子命令]   # 跑 --help 自动生成参数树\n\
          \x20 snip import-tldr <tldr仓库pages目录>\n\
          \x20 snip import-docs <手册页目录>       # man 等纯文本手册（man -P cat 导出）\n\
+         \x20 snip import-workflows <路径>         # Warp/Espanso/VSCode 工作流（自动识别格式）\n\
          \x20 snip hook [--install]             # 安装 bash 命令记录钩子\n\
          \x20 snip history [--limit N]          # 查看最近执行的命令\n\
          \x20 snip adopt <序号> \"描述\" [--tag]  # 把历史命令入库\n\
          \x20 snip export <文件.json>           # 导出个人记录（团队共享）\n\
          \x20 snip import-share <文件.json>     # 导入他人共享（智能合并）\n\
+         \x20 snip pin <id>                     # 收藏/取消置顶（搜索恒排最前）\n\
+         \x20 snip sync <git仓库地址>            # 团队同步：拉取合并→导出→提交推送\n\
          \x20 snip vacuum                       # 压缩数据库文件\n\
          \x20 snip stats / snip delete <id>"
     );
@@ -285,9 +291,13 @@ fn print_hits(hits: &[Hit]) {
             "tldr" => "📖",
             _ => "📄",
         };
-        println!("[{:>4}] {} ({}分, 用过{}次) {}", h.sn.id, mark, h.score, h.sn.used_count, h.sn.intent);
+        let pin = if h.sn.pinned { "📌 " } else { "" };
+        println!("[{:>4}] {}{} ({}分, 用过{}次) {}", h.sn.id, pin, mark, h.score, h.sn.used_count, h.sn.intent);
         println!("        {}", h.sn.cmd);
         let mut extra: Vec<String> = Vec::new();
+        if let Some(d) = &h.sn.danger {
+            extra.push(format!("⚠️{d}"));
+        }
         if let Some(p) = &h.sn.project {
             extra.push(format!("📁{p}"));
         }
@@ -394,6 +404,35 @@ fn cmd_import_docs(args: &[String]) -> i32 {
     }
 }
 
+// ---------- v1.9：工作流导入（Warp / Espanso / VS Code） ----------
+
+fn cmd_import_workflows(args: &[String]) -> i32 {
+    let Some(path) = args.first() else {
+        eprintln!("用法: snip import-workflows <文件或目录>");
+        eprintln!("格式自动识别：.json → VS Code snippets；.yaml 顶层 matches → Espanso 包；有 command → Warp Workflow");
+        eprintln!("例：snip import-workflows ~/.warp/workflows");
+        return 2;
+    };
+    let conn = match db::open() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("打开数据库失败: {e}");
+            return 1;
+        }
+    };
+    let p = snipnav::importer::expand_path(path);
+    match snipnav::workflows::import_path(&conn, &p) {
+        Ok(r) => {
+            println!("导入完成：{} 个文件，新增 {} 条，跳过重复 {} 条", r.files, r.snippets, r.skipped);
+            0
+        }
+        Err(e) => {
+            eprintln!("导入失败: {e}");
+            1
+        }
+    }
+}
+
 fn cmd_gen_params(args: &[String]) -> i32 {
     let Some(tool) = args.first() else {
         eprintln!("用法: snip gen-params <工具> [子命令]   例: snip gen-params docker logs");
@@ -464,7 +503,8 @@ fn cmd_history(args: &[String]) -> i32 {
     for (i, e) in entries.iter().enumerate() {
         let mark = if e.saved { "✅已入库" } else { "　存为记录→" };
         println!("[{:>3}] {} {}", i + 1, mark, e.cmd);
-        println!("       {}", e.ts);
+        let src = if e.shell == "powershell" { "（PowerShell）" } else { "" };
+        println!("       {} {}", e.ts, src);
     }
     0
 }
@@ -589,6 +629,80 @@ fn cmd_vacuum() -> i32 {
     let after = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
     println!("VACUUM 完成：{} KB → {} KB", before / 1024, after / 1024);
     0
+}
+
+// ---------- v1.5：收藏置顶 ----------
+
+fn cmd_pin(args: &[String]) -> i32 {
+    let Some(id) = args.first().and_then(|s| s.parse::<i64>().ok()) else {
+        eprintln!("用法: snip pin <id>   （再次执行同一 id 可取消置顶）");
+        return 2;
+    };
+    let conn = match db::open() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("打开数据库失败: {e}");
+            return 1;
+        }
+    };
+    let cur: i64 = conn
+        .query_row("SELECT pinned FROM snippets WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap_or(0);
+    let next = if cur == 0 { 1 } else { 0 };
+    match conn.execute("UPDATE snippets SET pinned = ?1 WHERE id = ?2", rusqlite::params![next, id]) {
+        Ok(0) => {
+            eprintln!("记录不存在: #{id}");
+            1
+        }
+        Ok(_) => {
+            if next == 1 {
+                println!("📌 已置顶 #{id}（snip pin {id} 取消）");
+            } else {
+                println!("已取消置顶 #{id}");
+            }
+            0
+        }
+        Err(e) => {
+            eprintln!("操作失败: {e}");
+            1
+        }
+    }
+}
+
+// ---------- v1.10：Git 仓库同步 ----------
+
+fn cmd_sync(args: &[String]) -> i32 {
+    let Some(url) = args.first() else {
+        eprintln!("用法: snip sync <git仓库地址>");
+        eprintln!("例：snip sync git@github.com:team/snipnav-sync.git");
+        eprintln!("    snip sync \\\\fileserver\\share\\snipnav-sync.git（内网裸仓库）");
+        eprintln!("首次执行会克隆到 ~/.snipnav/sync/；之后每次 = 拉取合并 → 导出 → 提交推送。");
+        eprintln!("注意：删除不传播（本地删掉的记录会被远端带回来）。");
+        return 2;
+    };
+    let conn = match db::open() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("打开数据库失败: {e}");
+            return 1;
+        }
+    };
+    match snipnav::sync::sync_repo(&conn, url) {
+        Ok(st) => {
+            println!(
+                "同步完成：远端新增 {} 条 / 合并 {} 条；已导出 {} 条个人记录；{}",
+                st.added,
+                st.merged,
+                st.exported,
+                if st.pushed { "已推送 ✓" } else { "远端无变化，未推送" }
+            );
+            0
+        }
+        Err(e) => {
+            eprintln!("同步失败: {e}");
+            1
+        }
+    }
 }
 
 fn cmd_delete(args: &[String]) -> i32 {

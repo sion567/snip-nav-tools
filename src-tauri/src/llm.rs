@@ -59,17 +59,65 @@ pub fn extract_json_array(content: &str) -> Vec<Suggest> {
 }
 
 fn config(conn: &Connection) -> Result<(String, String, String), String> {
-    let key = db::get_setting(conn, KEY_API_KEY).filter(|k| !k.trim().is_empty());
-    let Some(key) = key else {
-        return Err("未配置大模型 API Key（⚙️ 设置 → AI 兜底）".into());
-    };
     let base = db::get_setting(conn, KEY_BASE_URL)
         .filter(|u| !u.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_BASE_URL.to_string());
+    // v1.10：本地端点（Ollama 11434 / localhost）免 Key；远程接口必须有 Key
+    let key = db::get_setting(conn, KEY_API_KEY)
+        .map(|k| k.trim().to_string())
+        .unwrap_or_default();
+    let is_local = is_local_base(&base);
+    if key.is_empty() && !is_local {
+        return Err(
+            "未配置大模型 API Key（远程接口需要；本地 Ollama 免 Key——设置里点「检测本地 Ollama」自动填好）"
+                .into(),
+        );
+    }
     let model = db::get_setting(conn, KEY_MODEL)
         .filter(|m| !m.trim().is_empty())
         .unwrap_or_else(|| DEFAULT_MODEL.to_string());
     Ok((base, key, model))
+}
+
+/// 本地端点判定：Ollama 默认端口 11434，或显式指到 localhost/127.0.0.1。
+pub fn is_local_base(base: &str) -> bool {
+    let b = base.to_lowercase();
+    b.contains("11434") || b.contains("localhost") || b.contains("127.0.0.1")
+}
+
+/// v1.10：列出端点上的模型（OpenAI 兼容 GET /models，Ollama 同样支持）。
+/// 纯网络函数，不碰数据库；前端把当前填的 base_url 传进来即可探测。
+pub fn list_models(base_url: &str) -> Result<Vec<String>, String> {
+    let url = format!("{}/models", base_url.trim_end_matches('/'));
+    let agent = ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(5))
+        .build();
+    let resp: serde_json::Value = agent
+        .get(&url)
+        .call()
+        .map_err(|e| {
+            let b = base_url.to_lowercase();
+            if b.contains("11434") || b.contains("localhost") || b.contains("127.0.0.1") {
+                format!("连不上本地端点（Ollama 没在运行？先执行 ollama serve，或 ollama pull 一个模型）: {e}")
+            } else {
+                format!("拉取模型列表失败: {e}")
+            }
+        })?
+        .into_json()
+        .map_err(|e| format!("解析模型列表失败: {e}"))?;
+    let models: Vec<String> = resp
+        .get("data")
+        .and_then(|d| d.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| m.get("id").and_then(|v| v.as_str()).map(String::from))
+                .collect::<Vec<String>>()
+        })
+        .unwrap_or_default();
+    if models.is_empty() {
+        return Err("端点在线但没有可用模型（Ollama 先 ollama pull 一个）".into());
+    }
+    Ok(models)
 }
 
 /// AI 调用配置（v1.2 P0-3：持锁读出后即可释放库锁，网络阶段不再占用）。
@@ -111,9 +159,12 @@ pub fn generate(cfg: &LlmConfig, q: &str) -> Result<Vec<Suggest>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(30))
         .build();
-    let resp: serde_json::Value = agent
-        .post(&url)
-        .set("Authorization", &format!("Bearer {}", cfg.api_key))
+    // 本地 Ollama 免 Key 时不带 Authorization 头
+    let mut req = agent.post(&url);
+    if !cfg.api_key.trim().is_empty() {
+        req = req.set("Authorization", &format!("Bearer {}", cfg.api_key));
+    }
+    let resp: serde_json::Value = req
         .send_json(body)
         .map_err(|e| format!("请求失败: {e}"))?
         .into_json()
@@ -210,6 +261,20 @@ mod tests {
         db::set_setting(&conn, KEY_ENABLED, "1").unwrap();
         let err2 = suggest(&conn, "查大文件").unwrap_err();
         assert!(err2.contains("API Key"), "应提示配 Key：{err2}");
+    }
+
+    #[test]
+    fn local_endpoint_needs_no_key() {
+        let conn = Connection::open_in_memory().unwrap();
+        db::init_schema(&conn).unwrap();
+        db::set_setting(&conn, KEY_ENABLED, "1").unwrap();
+        db::set_setting(&conn, KEY_BASE_URL, "http://localhost:11434/v1").unwrap();
+        // Ollama 本地端点：没配 Key 也应通过配置校验（模型列表为空的错误在后面才发生）
+        let cfg = prepare(&conn, "查大文件").unwrap();
+        assert_eq!(cfg.base_url, "http://localhost:11434/v1");
+        assert!(cfg.api_key.is_empty());
+        assert!(is_local_base(&cfg.base_url));
+        assert!(!is_local_base(DEFAULT_BASE_URL), "远程 GLM 不算本地");
     }
 
     #[test]

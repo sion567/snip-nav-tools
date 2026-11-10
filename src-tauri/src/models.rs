@@ -14,11 +14,19 @@ pub struct Snippet {
     pub variant_of: Option<i64>,
     pub source: String,
     pub verified: bool,
+    pub pinned: bool,
+    /// v1.8：意图拼音（搜全拼/缩写用），前端不需要，不出序列化
+    #[serde(skip_serializing)]
+    pub intent_py: String,
+    #[serde(skip_serializing)]
+    pub intent_pyi: String,
     pub used_count: i64,
     pub last_used: Option<String>,
     pub created: String,
     pub notes: Option<String>,
     pub tags: Vec<String>,
+    /// v1.6：危险命令原因（读行时按规则即时计算，不落库；None = 无标记）
+    pub danger: Option<String>,
 }
 
 /// 搜索命中：记录 + 得分。
@@ -81,6 +89,29 @@ pub struct ExploreSaveInput {
     pub tags: Option<Vec<String>>,
 }
 
+// ---------- v1.7：Playbook 运行手册 ----------
+
+/// 手册（有序命令序列），steps 按顺序带出完整记录（含 ⚠️ danger）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Playbook {
+    pub id: i64,
+    pub name: String,
+    pub note: Option<String>,
+    pub created: String,
+    pub steps: Vec<Snippet>,
+}
+
+/// 新建/编辑手册：step_ids 顺序即步骤顺序（替换式重写）。
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlaybookInput {
+    pub id: Option<i64>,
+    pub name: String,
+    pub note: Option<String>,
+    pub step_ids: Vec<i64>,
+}
+
 // ---------- 出参（面板 / 统计） ----------
 
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +141,24 @@ pub struct Pattern {
     pub used_count: i64,
 }
 
+// ---------- v1.7：命令解释（explainshell 式逐段标注） ----------
+
+/// 一段命令的组成片段：flag 型片段带参数树描述（desc=None 表示参数树里没有）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CmdPart {
+    pub text: String,
+    pub desc: Option<String>,
+}
+
+/// 按管道分段后的解释：每段 = 该段工具 + 空格切分的片段列表。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExplainSeg {
+    pub tool: String,
+    pub parts: Vec<CmdPart>,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExplorePanel {
@@ -118,6 +167,8 @@ pub struct ExplorePanel {
     pub groups: Vec<ParamGroup>,
     pub patterns: Vec<Pattern>,
     pub related: Vec<Snippet>,
+    /// v1.7：命令逐段解释（管道分段 + flag 查参数树）
+    pub explain: Vec<ExplainSeg>,
 }
 
 #[derive(Debug, Serialize)]
@@ -137,6 +188,23 @@ pub struct Stats {
 pub struct TagCount {
     pub name: String,
     pub count: i64,
+}
+
+/// v1.9 使用热力图：某天的复制/保存动作次数（近一年，稀疏返回）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DayCount {
+    pub date: String, // YYYY-MM-DD
+    pub count: i64,
+}
+
+/// v1.9 工作流导入结果（Warp / Espanso / VS Code 统一）。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkflowImportResult {
+    pub files: i64,
+    pub snippets: i64,
+    pub skipped: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -161,4 +229,6 @@ pub struct HistoryEntry {
     pub ts: String,
     pub cmd: String,
     pub saved: bool,
+    /// v1.5：来源 shell（"bash" / "powershell"）；PowerShell 条目 ts 为空
+    pub shell: String,
 }

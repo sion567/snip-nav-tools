@@ -1,6 +1,6 @@
 //! 数据库层：连接、建表、通用读写。数据目录 ~/.snipnav（SNIPNAV_HOME 可覆盖）。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use rusqlite::{params, Connection, Row};
 
@@ -13,10 +13,13 @@ CREATE TABLE IF NOT EXISTS snippets (
     command     TEXT,
     project     TEXT,            -- 归属项目（目录名），搜索时可加权
     intent      TEXT DEFAULT '',
+    intent_py   TEXT DEFAULT '',   -- v1.8：意图拼音（"日志"→"rizhi"），搜全拼/缩写用
+    intent_pyi  TEXT DEFAULT '',   -- v1.8：意图拼音首字母（"日志过滤"→"rzgl"）
     cmd         TEXT DEFAULT '',
     variant_of  INTEGER REFERENCES snippets(id) ON DELETE SET NULL,
     source      TEXT NOT NULL DEFAULT 'self',
     verified    INTEGER NOT NULL DEFAULT 1,
+    pinned      INTEGER NOT NULL DEFAULT 0,  -- v1.5：收藏置顶（搜索排序恒置顶）
     used_count  INTEGER NOT NULL DEFAULT 0,
     last_used   TEXT,
     created     TEXT NOT NULL DEFAULT (date('now','localtime')),
@@ -88,6 +91,21 @@ CREATE TABLE IF NOT EXISTS doc_bodies(
 
 -- v0.5：应用设置（LLM 兜底配置等），键值存 SQLite，避免再引入配置文件格式
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+
+-- v1.7：Playbook 运行手册（部署/排障的有序命令序列，直击"团队交接靠口头"）
+CREATE TABLE IF NOT EXISTS playbooks(
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    name    TEXT NOT NULL,
+    note    TEXT,
+    created TEXT NOT NULL DEFAULT (date('now','localtime'))
+);
+CREATE TABLE IF NOT EXISTS playbook_items(
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    playbook_id INTEGER NOT NULL REFERENCES playbooks(id) ON DELETE CASCADE,
+    snippet_id  INTEGER NOT NULL REFERENCES snippets(id) ON DELETE CASCADE,
+    position    INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_playbook_items ON playbook_items(playbook_id, position);
 "#;
 
 /// FTS5 表 + 同步触发器。检索路径目前走 LIKE + 权重排序，
@@ -147,7 +165,64 @@ pub fn open() -> Result<Conn, String> {
         .map_err(|e| format!("设置外键约束失败: {e}"))?;
     init_schema(&conn)?;
     crate::seeds::seed_all(&conn)?;
+    backup_if_needed(&conn);
     Ok(Conn::new(conn))
+}
+
+// ---------- v1.7：滚动备份 ----------
+
+/// 备份保留份数：每天最多一份，超出删最旧。
+pub const BACKUP_KEEP: usize = 7;
+
+/// 启动时备份主库到 `<data>/backup/snippets-YYYYMMDD.db`（每天最多一次）。
+/// SQLite 在线备份 API，对 WAL 安全；失败静默——备份不该阻塞启动/CLI。
+pub fn backup_if_needed(conn: &Connection) {
+    let dir = match data_dir() {
+        Ok(d) => d.join("backup"),
+        Err(_) => return,
+    };
+    let dest = dir.join(format!("snippets-{}.db", today().replace('-', "")));
+    if dest.exists() {
+        return;
+    }
+    if backup_to(conn, &dest).is_ok() {
+        prune_backups(&dir, BACKUP_KEEP);
+    }
+}
+
+/// 在线备份到目标文件（父目录自动创建）。
+pub fn backup_to(conn: &Connection, dest: &Path) -> Result<(), String> {
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建备份目录失败: {e}"))?;
+    }
+    let mut dst = Connection::open(dest).map_err(|e| format!("打开备份目标失败: {e}"))?;
+    let backup =
+        rusqlite::backup::Backup::new(conn, &mut dst).map_err(|e| format!("初始化备份失败: {e}"))?;
+    backup
+        .run_to_completion(64, std::time::Duration::from_millis(1), None)
+        .map_err(|e| format!("备份执行失败: {e}"))?;
+    Ok(())
+}
+
+/// 只保留最近 keep 份备份（按文件名=日期排序删最旧）。
+pub fn prune_backups(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .filter(|n| n.starts_with("snippets-") && n.ends_with(".db"))
+        .collect();
+    names.sort();
+    if names.len() <= keep {
+        return;
+    }
+    let excess = names.len() - keep;
+    for name in names.into_iter().take(excess) {
+        // 删除失败只打日志不中断（Windows 上偶发句柄未及时释放；备份不阻塞主流程）
+        if let Err(e) = std::fs::remove_file(dir.join(&name)) {
+            eprintln!("备份清理：删除 {} 失败: {e}", dir.join(&name).display());
+        }
+    }
 }
 
 /// 带退出收尾的数据库连接（v1.2 P0-1）：Drop 时执行
@@ -189,7 +264,62 @@ pub fn init_schema(conn: &Connection) -> Result<(), String> {
     conn.execute_batch(BASE_SCHEMA)
         .map_err(|e| format!("建表失败: {e}"))?;
     let _ = conn.execute_batch(FTS_SCHEMA);
+    migrate(conn);
     Ok(())
+}
+
+/// 老库补列（幂等）：CREATE TABLE IF NOT EXISTS 不会给已存在的表加新列。
+/// v1.5：pinned 收藏置顶；v1.8：intent_py / intent_pyi 拼音列（含一次性回填）。
+fn migrate(conn: &Connection) {
+    let cols: Vec<String> = {
+        let Ok(mut stmt) = conn.prepare("SELECT name FROM pragma_table_info('snippets')") else {
+            return;
+        };
+        stmt.query_map([], |r| r.get::<_, String>(0))
+            .map(|rows| rows.flatten().collect())
+            .unwrap_or_default()
+    };
+    if !cols.iter().any(|c| c == "pinned") {
+        let _ = conn.execute_batch(
+            "ALTER TABLE snippets ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0;",
+        );
+    }
+    let has_py = cols.iter().any(|c| c == "intent_py");
+    if !has_py {
+        let _ = conn.execute_batch(
+            "ALTER TABLE snippets ADD COLUMN intent_py TEXT NOT NULL DEFAULT '';
+             ALTER TABLE snippets ADD COLUMN intent_pyi TEXT NOT NULL DEFAULT '';",
+        );
+    }
+    // 一次性回填：meta 标记与加列解耦（加列成功但回填中断时，下次启动能续跑）
+    let done: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meta WHERE key = 'py_backfill'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(1);
+    if done == 0 {
+        let _ = conn.execute_batch("BEGIN");
+        let rows: Vec<(i64, String)> = {
+            let Ok(mut stmt) = conn.prepare("SELECT id, IFNULL(intent,'') FROM snippets") else {
+                let _ = conn.execute_batch("ROLLBACK");
+                return;
+            };
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .map(|rows| rows.flatten().collect())
+                .unwrap_or_default()
+        };
+        for (id, intent) in rows {
+            let _ = conn.execute(
+                "UPDATE snippets SET intent_py = ?2, intent_pyi = ?3 WHERE id = ?1",
+                params![id, crate::tagging::pinyin_full(&intent), crate::tagging::pinyin_initials(&intent)],
+            );
+        }
+        let _ = conn.execute_batch(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES('py_backfill', 1); COMMIT;",
+        );
+    }
 }
 
 pub fn today() -> String {
@@ -255,18 +385,23 @@ pub fn set_setting(conn: &Connection, key: &str, value: &str) -> Result<(), Stri
 }
 
 pub(crate) fn snippet_from_row(r: &Row) -> rusqlite::Result<Snippet> {
+    let cmd_text: String = r.get::<_, Option<String>>("cmd")?.unwrap_or_default();
     Ok(Snippet {
         id: r.get("id")?,
         tool: r.get("tool")?,
         command: r.get("command")?,
         project: r.get("project")?,
         intent: r.get::<_, Option<String>>("intent")?.unwrap_or_default(),
-        cmd: r.get::<_, Option<String>>("cmd")?.unwrap_or_default(),
+        danger: crate::tagging::danger_reason(&cmd_text).map(String::from),
+        cmd: cmd_text,
         variant_of: r.get("variant_of")?,
         source: r
             .get::<_, Option<String>>("source")?
             .unwrap_or_else(|| "self".into()),
         verified: r.get::<_, i64>("verified")? != 0,
+        pinned: r.get::<_, i64>("pinned").unwrap_or(0) != 0,
+        intent_py: r.get::<_, Option<String>>("intent_py").unwrap_or_default().unwrap_or_default(),
+        intent_pyi: r.get::<_, Option<String>>("intent_pyi").unwrap_or_default().unwrap_or_default(),
         used_count: r.get("used_count")?,
         last_used: r.get("last_used")?,
         created: r
@@ -363,15 +498,20 @@ pub struct NewSnippet<'a> {
 }
 
 pub fn insert_snippet(conn: &Connection, n: NewSnippet) -> Result<i64, String> {
+    // v1.8：意图拼音随插入写入（搜索层直接 LIKE 这两列）
+    let py = crate::tagging::pinyin_full(n.intent);
+    let pyi = crate::tagging::pinyin_initials(n.intent);
     conn.execute(
-        "INSERT INTO snippets(tool, command, project, intent, cmd, variant_of, source, verified,
-                              used_count, last_used, notes)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        "INSERT INTO snippets(tool, command, project, intent, intent_py, intent_pyi, cmd,
+                              variant_of, source, verified, used_count, last_used, notes)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             n.tool,
             n.command,
             n.project,
             n.intent,
+            py,
+            pyi,
             n.cmd,
             n.variant_of,
             n.source,
@@ -420,5 +560,58 @@ mod tests {
         .unwrap();
         assert!(!is_empty(&conn, "snippets"));
         assert!(is_empty(&conn, "patterns"));
+    }
+
+    #[test]
+    fn backup_roundtrip_and_prune() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_schema(&conn).unwrap();
+        insert_snippet(
+            &conn,
+            NewSnippet {
+                intent: "备份验证记录",
+                cmd: "echo backup",
+                project: None,
+                tool: None,
+                command: None,
+                variant_of: None,
+                source: "self",
+                verified: true,
+                used_count: 0,
+                last_used: None,
+                notes: None,
+            },
+        )
+        .unwrap();
+
+        let dir = std::env::temp_dir().join(format!("snipnav-bk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let dest = dir.join("snippets-20260101.db");
+        backup_to(&conn, &dest).unwrap();
+
+        // 备份文件可独立打开且数据完整（限作用域：校验连接先关闭再 prune，
+        // 否则 Windows 下文件被自己占用，remove_file 报 os error 32）
+        {
+            let dst = Connection::open(&dest).unwrap();
+            let n: i64 = dst
+                .query_row("SELECT COUNT(*) FROM snippets WHERE cmd = 'echo backup'", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(n, 1, "备份文件应含刚写入的记录");
+        }
+
+        // 伪造更旧的/更旧的 10 份，prune 后只剩 7
+        for i in 1..=10 {
+            let _ = std::fs::write(dir.join(format!("snippets-2026{:02}05.db", i)), "fake");
+        }
+        prune_backups(&dir, BACKUP_KEEP);
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names.len(), BACKUP_KEEP, "应保留最近 7 份，实际剩余: {names:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

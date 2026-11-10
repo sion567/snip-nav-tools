@@ -21,11 +21,12 @@ pub const FTS_THRESHOLD: i64 = 20_000;
 /// 中文关键词扫它没有意义，永远排除（v1.1 优化包 ②）。
 const OWN_SOURCES: &str = "('self','tldr','ai')";
 
-/// 每个关键词在 7 个字段上做 LIKE 匹配（含标签关联子查询）。
+/// 每个关键词在 9 个字段上做 LIKE 匹配（含拼音两列与标签关联子查询）。
 /// 用匿名占位符 ?（按出现顺序绑定），多个关键词拼接时参数天然对齐。
 const CAND_COND: &str = "(s.intent LIKE ? ESCAPE '\\' OR s.cmd LIKE ? ESCAPE '\\' \
      OR s.notes LIKE ? ESCAPE '\\' OR s.tool LIKE ? ESCAPE '\\' \
      OR s.command LIKE ? ESCAPE '\\' OR s.project LIKE ? ESCAPE '\\' \
+     OR s.intent_py LIKE ? ESCAPE '\\' OR s.intent_pyi LIKE ? ESCAPE '\\' \
      OR EXISTS (SELECT 1 FROM snippet_tags st JOIN tags t ON t.id = st.tag_id \
                 WHERE st.snippet_id = s.id AND t.name LIKE ? ESCAPE '\\'))";
 
@@ -57,10 +58,10 @@ pub fn search_with_opts(
         .collect();
 
     let mut cands: Vec<Snippet> = if keywords.is_empty() {
-        // 空查询：常用优先（近期使用的个人记录天然靠前）
+        // 空查询：置顶 > 常用（近期使用的个人记录天然靠前）
         db::query_snippets(
             conn,
-            "SELECT * FROM snippets ORDER BY used_count DESC, last_used DESC, id DESC LIMIT 200",
+            "SELECT * FROM snippets ORDER BY pinned DESC, used_count DESC, last_used DESC, id DESC LIMIT 200",
             &[],
         )?
     } else if fts_threshold < db::snippet_count(conn) && db::has_fts(conn) {
@@ -114,7 +115,7 @@ fn like_candidates(conn: &Connection, keywords: &[String], own_only: bool) -> Re
     let mut params: Vec<String> = Vec::new();
     for kw in keywords {
         let like = format!("%{}%", escape_like(kw));
-        for _ in 0..7 {
+        for _ in 0..9 {
             params.push(like.clone());
         }
     }
@@ -202,6 +203,10 @@ fn attach_tags_batch(conn: &Connection, sns: &mut [Snippet]) {
 /// 设计 §4.2 权重 + 项目命中加成。
 pub fn score(sn: &Snippet, keywords: &[String], project: Option<&str>) -> i64 {
     let mut s: i64 = 0;
+    // v1.5 Pin：收藏置顶恒压过一切常规权重（self+高频+项目加成总和一般 < 200）
+    if sn.pinned {
+        s += 500;
+    }
     if sn.source == "self" {
         s += 50;
     }
@@ -233,6 +238,10 @@ pub fn score(sn: &Snippet, keywords: &[String], project: Option<&str>) -> i64 {
         }
         if intent.contains(kw.as_str()) {
             s += 5;
+        }
+        // v1.8 拼音命中：ASCII 关键词在全拼/缩写列命中（比直接命中意图略低）
+        if kw.is_ascii() && (sn.intent_py.contains(kw.as_str()) || sn.intent_pyi.contains(kw.as_str())) {
+            s += 4;
         }
         if cmd.contains(kw.as_str()) || base.contains(kw.as_str()) {
             s += 2;
@@ -286,7 +295,7 @@ pub fn browse(conn: &Connection, q: &str, limit: usize) -> Result<DocBrowse, Str
     let mut params: Vec<String> = Vec::new();
     for kw in &keywords {
         let like = format!("%{}%", escape_like(kw));
-        for _ in 0..7 {
+        for _ in 0..9 {
             params.push(like.clone());
         }
     }
@@ -430,6 +439,26 @@ mod tests {
     }
 
     #[test]
+    fn pinned_snippet_ranks_first() {
+        let conn = setup();
+        let hot = add(&conn, "git 高频命令", "git log --oneline", None, "self", 99, Some(&db::today()));
+        let pinned = add(&conn, "git 置顶的冷门命令", "git clean -fdx", None, "self", 0, None);
+        conn.execute("UPDATE snippets SET pinned = 1 WHERE id = ?1", [pinned])
+            .unwrap();
+
+        // 空查询：置顶压过最高频
+        let hits = search(&conn, "", None, 20).unwrap();
+        assert_eq!(hits[0].sn.id, pinned, "空查询置顶必须第一");
+
+        // 关键词同时命中两条：命中集内置顶排最前
+        //（Pin 只在命中集内排序，不向结果注入不相关记录——搜索"git log"
+        //  冒出无关的置顶记录是噪音，不是置顶的语义）
+        let hits = search(&conn, "git", None, 20).unwrap();
+        assert_eq!(hits[0].sn.id, pinned, "命中集内置顶第一");
+        assert!(hits.iter().any(|h| h.sn.id == hot), "高频记录仍在结果里");
+    }
+
+    #[test]
     fn fts_path_agrees_with_like_for_ascii() {
         let conn = setup();
         assert!(db::has_fts(&conn), "bundled SQLite 应含 FTS5");
@@ -516,6 +545,24 @@ mod tests {
         assert_eq!(r.tools[0].name, "docker", "条数最多的工具在前");
         assert_eq!(r.tools[0].count, 2);
         assert!(r.tools.iter().any(|t| t.name == "git"));
+    }
+
+    #[test]
+    fn pinyin_keyword_matches_intent() {
+        let conn = setup();
+        // 意图是中文，搜全拼与首字母缩写都能命中
+        let a = add(&conn, "gradle 启动指定端口", "./gradlew bootRun --args=--server.port=8081", None, "self", 0, None);
+        let b = add(&conn, "日志按时间过滤", "docker logs --since 1h", None, "self", 0, None);
+
+        let full = search(&conn, "qidong", None, 20).unwrap();
+        assert!(full.iter().any(|h| h.sn.id == a), "全拼 qidong 应命中「启动」: {:?}", full.iter().map(|h| h.sn.intent.clone()).collect::<Vec<_>>());
+
+        let initials = search(&conn, "rz", None, 20).unwrap();
+        assert!(initials.iter().any(|h| h.sn.id == b), "缩写 rz 应命中「日志」");
+
+        // 中文关键词照常工作（拼音列不干扰原有路径）
+        let cn = search(&conn, "启动", None, 20).unwrap();
+        assert!(cn.iter().any(|h| h.sn.id == a));
     }
 
     #[test]

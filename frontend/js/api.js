@@ -51,14 +51,20 @@
   };
 
   M.history = [
-    { ts: '2026-10-26T10:12:01', cmd: 'docker logs --tail 100 -t mycontainer' },
-    { ts: '2026-10-26T10:08:44', cmd: 'ffmpeg -i in.mp4 -vn -acodec copy out.m4a' },
-    { ts: '2026-10-26T09:57:30', cmd: 'netstat -ano | findstr :8080' },
-    { ts: '2026-10-26T09:51:12', cmd: 'git log --oneline --grep=登录' },
-    { ts: '2026-10-26T09:40:03', cmd: 'tar -xzvf bundle.tar.gz -C /tmp/out' },
+    { ts: '2026-10-26T10:12:01', cmd: 'docker logs --tail 100 -t mycontainer', shell: 'bash' },
+    { ts: '2026-10-26T10:08:44', cmd: 'ffmpeg -i in.mp4 -vn -acodec copy out.m4a', shell: 'bash' },
+    { ts: '2026-10-26T09:57:30', cmd: 'netstat -ano | findstr :8080', shell: 'bash' },
+    { ts: '', cmd: 'Get-ChildItem Env: | Out-String', shell: 'powershell' },
+    { ts: '', cmd: 'wsl --shutdown', shell: 'powershell' },
+    { ts: '2026-10-26T09:51:12', cmd: 'git log --oneline --grep=登录', shell: 'bash' },
+    { ts: '2026-10-26T09:40:03', cmd: 'tar -xzvf bundle.tar.gz -C /tmp/out', shell: 'bash' },
   ];
   M.settings = { llm_enabled: '0', llm_base_url: '', llm_api_key: '', llm_model: '' };
   M.autostart = false;
+  // v1.7 Playbook Mock 示例（步骤引用上面的 snippets id）
+  M.playbooks = [
+    { id: 1, name: 'shop-admin 发版流程', note: '周四发版前照着走', created: TODAY, stepIds: [1, 2, 4] },
+  ];
 
   const CATEGORY_LABELS = { time: '时间过滤', output: '输出控制', filter: '内容过滤', pipe: '管道过滤', run: '运行控制', other: '其他' };
   const CATEGORY_ORDER = ['time', 'output', 'filter', 'pipe', 'run'];
@@ -87,8 +93,23 @@
   }
   function taks(t) { return (t === './gradlew' || t === 'gradlew') ? 'gradle' : t; }
 
+  // v1.6 危险命令（Mock 用，与 Rust tagging::danger_reason 同款规则的子集）
+  function dangerOf(cmd) {
+    const c = (cmd || '').toLowerCase();
+    const rules = [
+      ['rm -rf', '递归强删，不可恢复'], ['git reset --hard', '丢弃全部未提交修改'],
+      ['git push --force', '强制覆盖远端历史'], ['git clean -f', '删除未跟踪文件'],
+      ['drop table', '删表'], ['drop database', '删库'],
+      ['docker system prune -a', '删除全部未使用镜像'], ['docker system prune', '清理未用容器/网络/缓存'],
+      ['kubectl delete', '删除 K8s 资源'], ['chmod 777', '全开放权限'],
+    ];
+    for (const [p, w] of rules) if (c.includes(p)) return w;
+    return null;
+  }
+
   function mockScore(sn, kws, project) {
     let s = 0;
+    if (sn.pinned) s += 500;
     if (sn.source === 'self') s += 50;
     if (project && sn.project && sn.project.toLowerCase() === project.toLowerCase()) s += 30;
     s += sn.usedCount * 2;
@@ -116,7 +137,7 @@
           list.sort((a, b) => b.sn.usedCount - a.sn.usedCount);
         }
         if (kws.length) list.sort((a, b) => b.score - a.score || b.sn.usedCount - a.sn.usedCount);
-        return list.slice(0, 50).map(({ sn, score }) => Object.assign(cloneSn(sn), { score }));
+        return list.slice(0, 50).map(({ sn, score }) => Object.assign(cloneSn(sn), { score, danger: dangerOf(sn.cmd) }));
       }
       case 'browse_docs': {
         // v1.4 文档库浏览 Mock：与 Rust browse 同语义（AND 收窄、来源分组、字母序）
@@ -144,7 +165,8 @@
           (a.intent || '').localeCompare(b.intent || ''));
         const groups = [];
         for (const key of Object.keys(order)) {
-          const items = sorted.filter((s) => s.source === key).map(cloneSn);
+          const items = sorted.filter((s) => s.source === key)
+            .map((s) => Object.assign(cloneSn(s), { danger: dangerOf(s.cmd) }));
           if (items.length) groups.push({ key, label: labels[key], items });
         }
         return { query: kws.join(' '), total: sorted.length, groups, tools: [] };
@@ -181,6 +203,12 @@
       case 'delete_snippet':
         M.snippets = M.snippets.filter((s) => s.id !== args.id);
         return null;
+      case 'set_pinned': {
+        const sn = M.snippets.find((s) => s.id === args.id);
+        if (!sn) throw new Error('记录不存在');
+        sn.pinned = !!args.pinned;
+        return cloneSn(sn);
+      }
       case 'copy_snippet': {
         const sn = M.snippets.find((s) => s.id === args.id);
         if (!sn) throw new Error('记录不存在');
@@ -198,6 +226,52 @@
         }
         sn.usedCount++; sn.lastUsed = TODAY;
         return null;
+      }
+      // v1.7 命令解释（与 Rust build_explain 同语义：管道分段、flag 查参数树、
+      // 子命令级优先、合并短旗标逐字符查）
+      function flagMap(tool, subcmd) {
+        const map = {};
+        for (const p of M.paramTree) {
+          if (p.tool !== tool) continue;
+          // 有子命令时收「该子命令 + 工具级」；无子命令只收工具级
+          if (subcmd ? (p.command && p.command !== subcmd) : !!p.command) continue;
+          for (const cand of String(p.flag).split(/[,，\t ]+/)) {
+            const c = cand.trim().split('=')[0];
+            if (c.startsWith('-') && c.length >= 2 && (map[c] === undefined || subcmd)) {
+              map[c] = p.desc;
+            }
+          }
+        }
+        return map;
+      }
+      function explainToken(tok, map) {
+        if (tok.startsWith('--')) {
+          const name = tok.slice(2).split('=')[0];
+          return { text: tok, desc: map['--' + name] || null };
+        }
+        if (tok.startsWith('-') && tok.length > 2 && !tok.startsWith('--')) {
+          const descs = [];
+          for (const ch of tok.slice(1)) {
+            const key = '-' + ch;
+            if (map[key]) descs.push(key + '：' + map[key]);
+          }
+          return { text: tok, desc: descs.length ? descs.join('；') : null };
+        }
+        return { text: tok, desc: map[tok] || null };
+      }
+      function mockExplain(cmd) {
+        const segs = [];
+        for (const seg of (cmd || '').split('|')) {
+          const s = seg.trim();
+          if (!s) continue;
+          const toks = s.split(/\s+/);
+          const raw = toks[0].toLowerCase();
+          const tool = (raw === './gradlew' || raw === 'gradlew') ? 'gradle' : raw;
+          const subcmd = toks[1] && !toks[1].startsWith('-') ? toks[1] : '';
+          const map = flagMap(tool, subcmd);
+          segs.push({ tool, parts: toks.map((t) => explainToken(t, map)) });
+        }
+        return segs;
       }
       case 'explore': {
         const sn = M.snippets.find((s) => s.id === args.id);
@@ -220,7 +294,7 @@
           const ids = new Set([sn.id, ...related.map((r) => r.id)]);
           related = related.concat(M.snippets.filter((s) => !ids.has(s.id)).slice(0, 8 - related.length));
         }
-        return { base: cloneSn(sn), baseName, groups, patterns, related: related.map(cloneSn) };
+        return { base: cloneSn(sn), baseName, groups, patterns, related: related.map(cloneSn), explain: mockExplain(sn.cmd) };
       }
       case 'explore_save': {
         const base = M.snippets.find((s) => s.id === args.id);
@@ -253,6 +327,25 @@
       }
       case 'app_version':
         return '0.0.0-mock';
+      case 'heatmap': {
+        // Mock：近一年确定性伪随机数据（周末偏低）
+        const days = [];
+        const now = new Date();
+        for (let i = 364; i >= 0; i--) {
+          const d = new Date(now);
+          d.setDate(now.getDate() - i);
+          const iso = d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0');
+          const seed = (i * 7919) % 23;
+          const weekend = d.getDay() === 0 || d.getDay() === 6;
+          const n = Math.max(0, Math.round(seed / (weekend ? 6 : 2)) - (i > 350 ? 1 : 0));
+          if (n > 0) days.push({ date: iso, count: n });
+        }
+        return days;
+      }
+      case 'import_workflows':
+        return { files: 0, snippets: 0, skipped: 0 };
+      case 'llm_models':
+        return ['qwen2.5:7b', 'llama3.2', 'glm4:9b']; // Mock：本地模型列表
       case 'import_tldr':
         return { pages: 0, snippets: 0, skipped: 0 };
       case 'generate_params': {
@@ -272,6 +365,7 @@
         return M.history.slice(0, (args.limit || 100)).map((e) => ({
           ts: e.ts,
           cmd: e.cmd,
+          shell: e.shell || 'bash',
           saved: M.snippets.some((s) => (s.source === 'self' || s.source === 'ai') && s.cmd === e.cmd),
         }));
       case 'llm_suggest': {
@@ -316,13 +410,79 @@
         M.autostart = true; return null;
       case 'autostart_disable':
         M.autostart = false; return null;
+      case 'set_quick_hotkey':
+        M.settings.quick_hotkey = (args.hotkey || '').trim();
+        return null;
+      case 'quick_hide':
+        return null; // 浏览器里没有浮窗可关
+      case 'playbooks':
+        return M.playbooks.map((pb) => ({
+          id: pb.id, name: pb.name, note: pb.note, created: pb.created,
+          steps: pb.stepIds.map((sid) => {
+            const sn = M.snippets.find((s) => s.id === sid);
+            return sn ? Object.assign(cloneSn(sn), { danger: dangerOf(sn.cmd) }) : null;
+          }).filter(Boolean),
+        }));
+      case 'playbook_save': {
+        const p = args.payload;
+        const pb = {
+          id: p.id || Math.max(0, ...M.playbooks.map((x) => x.id)) + 1,
+          name: p.name, note: p.note || null, created: TODAY, stepIds: p.stepIds || [],
+        };
+        const idx = M.playbooks.findIndex((x) => x.id === pb.id);
+        if (idx >= 0) M.playbooks[idx] = pb; else M.playbooks.unshift(pb);
+        return {
+          id: pb.id, name: pb.name, note: pb.note, created: pb.created,
+          steps: pb.stepIds.map((sid) => M.snippets.find((s) => s.id === sid)).filter(Boolean).map(cloneSn),
+        };
+      }
+      case 'playbook_delete':
+        M.playbooks = M.playbooks.filter((x) => x.id !== args.id);
+        return null;
+      case 'paste_and_hide':
+        return null; // 浏览器里没有浮窗/模拟按键
+      case 'pending_clipboard':
+        // Mock：给一条示例待入库命令，方便调试横幅 UI（忽略后不再出现）
+        return M.pendingClip !== undefined ? M.pendingClip
+          : { cmd: 'docker system prune -af --volumes', ts: '10:12:00' };
+      case 'dismiss_pending_clipboard':
+        M.pendingClip = null;
+        return null;
       default:
         throw new Error('Mock 未实现命令: ' + cmd);
     }
   }
 
-  window.SNIP = {
+  // ---------- v1.7 动态变量（Espanso 式）：复制时自动替换 {{date}} 等 ----------
+  // 与用户占位符共用 {{}} 语法；已知变量名复制时自动展开，其余仍走「占位符填空」。
+  const AUTO_VARS = {
+    date: () => {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate());
+    },
+    time: () => {
+      const d = new Date();
+      const p = (n) => String(n).padStart(2, '0');
+      return p(d.getHours()) + ':' + p(d.getMinutes());
+    },
+    year: () => String(new Date().getFullYear()),
+  };
+  const SNIP = {
     invoke,
     isTauri: !!tauriCore,
+    autoVarNames: Object.keys(AUTO_VARS),
+    autoVarValue: (name) => (AUTO_VARS[name] ? AUTO_VARS[name]() : null),
+    // 展开命令里全部已知动态变量（不动用户占位符）
+    expandAutoVars: (cmd) => {
+      let out = cmd || '';
+      for (const name of Object.keys(AUTO_VARS)) {
+        const v = AUTO_VARS[name]();
+        out = out.split('{{' + name + '}}').join(v);
+        out = out.split('<' + name + '>').join(v);
+      }
+      return out;
+    },
   };
+  window.SNIP = SNIP;
 })();

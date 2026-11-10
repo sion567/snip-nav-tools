@@ -55,46 +55,106 @@ pub fn log_path() -> Result<PathBuf, String> {
     Ok(db::data_dir()?.join("history.log"))
 }
 
-const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+/// v1.5：PSReadLine 历史文件（Windows；PowerShell 5.1 与 7+ 默认共用此路径）。
+/// 读文件即可采集，无需装钩子；非 Windows 返回 None。
+pub fn ps_history_path() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    let appdata = std::env::var("APPDATA").ok()?;
+    let p = PathBuf::from(appdata)
+        .join("Microsoft")
+        .join("Windows")
+        .join("PowerShell")
+        .join("PSReadLine")
+        .join("ConsoleHost_history.txt");
+    p.exists().then_some(p)
+}
 
-/// 读取最近的 history（新→旧），超过 5MB 时自动裁剪保留末尾。
-/// 过滤：snip 自身命令、与上一条重复的连续命令。
-pub fn read_recent(conn: &Connection, limit: usize) -> Vec<HistoryEntry> {
-    let path = match log_path() {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
-    rotate_if_large(&path);
-    let content = std::fs::read_to_string(&path).unwrap_or_default();
-
-    let mut out: Vec<HistoryEntry> = Vec::new();
-    let mut prev_cmd = String::new();
+/// 解析 PSReadLine 历史内容：一行一条（新→旧倒序取），过滤 snip 自身命令与连续重复。
+/// PSReadLine 不记时间戳，时间显示交由前端用来源标记代替。
+pub fn parse_ps_history(content: &str, limit: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut prev = String::new();
     for line in content.lines().rev() {
         if out.len() >= limit {
             break;
         }
-        let Some((ts, cmd)) = line.split_once('\t') else { continue };
-        let cmd = cmd.trim();
-        if cmd.is_empty() || cmd == prev_cmd {
+        let cmd = line.trim();
+        if cmd.is_empty() || cmd == prev {
             continue;
         }
         if cmd == "snip" || cmd.starts_with("snip ") || cmd.starts_with("snipnav") {
             continue;
         }
-        prev_cmd = cmd.to_string();
-        let saved: bool = conn
-            .query_row(
-                "SELECT COUNT(*) FROM snippets WHERE cmd = ?1 AND source IN ('self','ai')",
-                params![cmd],
-                |r| r.get::<_, i64>(0),
-            )
-            .unwrap_or(0)
-                > 0;
-        out.push(HistoryEntry {
-            ts: ts.to_string(),
-            cmd: cmd.to_string(),
-            saved,
-        });
+        prev = cmd.to_string();
+        out.push(cmd.to_string());
+    }
+    out
+}
+
+fn is_saved(conn: &Connection, cmd: &str) -> bool {
+    conn.query_row(
+        "SELECT COUNT(*) FROM snippets WHERE cmd = ?1 AND source IN ('self','ai')",
+        params![cmd],
+        |r| r.get::<_, i64>(0),
+    )
+    .unwrap_or(0)
+        > 0
+}
+
+const MAX_LOG_BYTES: u64 = 5 * 1024 * 1024;
+
+/// 读取最近执行记录（新→旧），超过 5MB 时自动裁剪保留末尾。
+/// 两个来源合并：① bash 钩子的 history.log（带时间戳，在前）；
+/// ② PSReadLine 历史文件（v1.5，无时间戳，附加在后，来源标记 ⚡）。
+/// 过滤：snip 自身命令、与上一条重复的连续命令。
+pub fn read_recent(conn: &Connection, limit: usize) -> Vec<HistoryEntry> {
+    let mut out: Vec<HistoryEntry> = Vec::new();
+
+    // ① bash 钩子日志
+    if let Ok(path) = log_path() {
+        rotate_if_large(&path);
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        let mut prev_cmd = String::new();
+        for line in content.lines().rev() {
+            if out.len() >= limit {
+                break;
+            }
+            let Some((ts, cmd)) = line.split_once('\t') else { continue };
+            let cmd = cmd.trim();
+            if cmd.is_empty() || cmd == prev_cmd {
+                continue;
+            }
+            if cmd == "snip" || cmd.starts_with("snip ") || cmd.starts_with("snipnav") {
+                continue;
+            }
+            prev_cmd = cmd.to_string();
+            let saved = is_saved(conn, cmd);
+            out.push(HistoryEntry {
+                ts: ts.to_string(),
+                cmd: cmd.to_string(),
+                saved,
+                shell: "bash".into(),
+            });
+        }
+    }
+
+    // ② PSReadLine（Windows）
+    let remaining = limit.saturating_sub(out.len());
+    if remaining > 0 {
+        if let Some(p) = ps_history_path() {
+            let content = std::fs::read_to_string(&p).unwrap_or_default();
+            for cmd in parse_ps_history(&content, remaining) {
+                let saved = is_saved(conn, &cmd);
+                out.push(HistoryEntry {
+                    ts: String::new(),
+                    cmd,
+                    saved,
+                    shell: "powershell".into(),
+                });
+            }
+        }
     }
     out
 }
@@ -118,6 +178,28 @@ fn rotate_if_large(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_ps_history_filters_and_dedupes() {
+        let content = "docker ps -a\n\
+                       docker ps -a\n\
+                       snip search x\n\
+                       kubectl get pods -n prod\n\
+                       \n\
+                       git status --short\n";
+        let cmds = parse_ps_history(content, 100);
+        assert_eq!(
+            cmds,
+            vec![
+                "git status --short",
+                "kubectl get pods -n prod",
+                "docker ps -a",
+            ],
+            "倒序输出、滤掉 snip 与连续重复：{cmds:?}"
+        );
+        // limit 生效
+        assert_eq!(parse_ps_history(content, 2).len(), 2);
+    }
 
     #[test]
     fn hook_script_has_marker_and_prompt_hook() {

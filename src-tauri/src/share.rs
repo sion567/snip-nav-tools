@@ -16,6 +16,9 @@ pub struct ShareEntry {
     pub tags: Vec<String>,
     pub used_count: i64,
     pub notes: Option<String>,
+    /// v1.5：收藏置顶随团队共享同步；旧分享文件缺此字段时按 false
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -29,7 +32,7 @@ pub struct ShareFile {
 /// 导出全部个人记录（source = self）。
 pub fn export_self(conn: &Connection, path: &std::path::Path) -> Result<usize, String> {
     let mut stmt = conn
-        .prepare("SELECT id, intent, cmd, project, used_count, notes FROM snippets WHERE source = 'self' ORDER BY id")
+        .prepare("SELECT id, intent, cmd, project, used_count, notes, pinned FROM snippets WHERE source = 'self' ORDER BY id")
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| {
@@ -40,13 +43,14 @@ pub fn export_self(conn: &Connection, path: &std::path::Path) -> Result<usize, S
                 r.get::<_, Option<String>>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, i64>(6)? != 0,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut entries = Vec::new();
     for row in rows.flatten() {
-        let (id, intent, cmd, project, used_count, notes) = row;
+        let (id, intent, cmd, project, used_count, notes, pinned) = row;
         let tags = db::snippet_tags(conn, id);
         entries.push(ShareEntry {
             intent,
@@ -55,6 +59,7 @@ pub fn export_self(conn: &Connection, path: &std::path::Path) -> Result<usize, S
             tags,
             used_count,
             notes,
+            pinned,
         });
     }
     let n = entries.len();
@@ -91,8 +96,8 @@ pub fn import_share(conn: &Connection, path: &std::path::Path) -> Result<ImportS
         match existing {
             Some(id) => {
                 conn.execute(
-                    "UPDATE snippets SET used_count = MAX(used_count, ?2) WHERE id = ?1",
-                    params![id, e.used_count],
+                    "UPDATE snippets SET used_count = MAX(used_count, ?2), pinned = MAX(pinned, ?3) WHERE id = ?1",
+                    params![id, e.used_count, e.pinned as i64],
                 )
                 .map_err(|er| er.to_string())?;
                 let mut tags = db::snippet_tags(conn, id);
@@ -125,6 +130,9 @@ pub fn import_share(conn: &Connection, path: &std::path::Path) -> Result<ImportS
                 let mut tags = e.tags.clone();
                 tags.extend(tagging::auto_tags(&e.cmd, &e.intent));
                 db::set_tags(conn, new_id, &tags)?;
+                if e.pinned {
+                    let _ = conn.execute("UPDATE snippets SET pinned = 1 WHERE id = ?1", [new_id]);
+                }
                 stat.added += 1;
             }
         }
@@ -166,6 +174,7 @@ mod tests {
             tags: vec!["media".to_string()],
             used_count: 3,
             notes: None,
+            pinned: true,
         });
         std::fs::write(&file, serde_json::to_string(&sf).unwrap()).unwrap();
         let st2 = import_share(&conn, &file).unwrap();

@@ -1,1 +1,1 @@
-{"default":{"identifier":"default","description":"SnipNav 主窗口默认能力","local":true,"windows":["main"],"permissions":["core:default","autostart:default"]}}
+{"default":{"identifier":"default","description":"SnipNav 主窗口与速查浮窗默认能力","local":true,"windows":["main","quick"],"permissions":["core:default","autostart:default"]}}

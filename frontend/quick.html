@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SnipNav 速查</title>
+<script>
+  // 首帧前应用记忆的主题，避免闪烁（与 index.html 同款逻辑）
+  try {
+    if (localStorage.getItem('snipnav-theme') === 'light') {
+      document.documentElement.dataset.theme = 'light';
+    }
+  } catch (e) {}
+</script>
+<link rel="stylesheet" href="style.css">
+<link rel="stylesheet" href="quick.css">
+</head>
+<body class="quick">
+<div id="app"></div>
+<script src="vendor/vue.global.prod.js"></script>
+<script src="js/api.js"></script>
+<script src="js/quick.js"></script>
+</body>
+</html>
